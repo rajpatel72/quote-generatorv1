@@ -130,6 +130,9 @@ if not GEMINI_API_KEY:
 st.session_state.setdefault("single_extracted", None)
 st.session_state.setdefault("single_result", None)
 st.session_state.setdefault("consolidated_result", None)
+st.session_state.setdefault("consolidated_extracted", None)
+st.session_state.setdefault("consolidated_result", None)
+st.session_state.setdefault("consolidated_client_name", "")
 
 EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -393,7 +396,8 @@ def render_single_result(res: dict):
 # ---------------------------------------------------------------------------
 # Consolidated pipeline
 # ---------------------------------------------------------------------------
-def process_consolidated(pdf_bytes_list, filenames, client_name):
+def extract_consolidated(pdf_bytes_list, filenames):
+    """Phase 1: Extract data from all PDFs, but hold off on Excel generation."""
     with tempfile.TemporaryDirectory() as tmp:
         pdf_paths = []
         for data, name in zip(pdf_bytes_list, filenames):
@@ -429,28 +433,78 @@ def process_consolidated(pdf_bytes_list, filenames, client_name):
                 st.error("No sites were found in the uploaded PDF(s). Double-check the file(s) and try again.")
                 return None
 
-            status.write(f"\u2705 Found {len(bills)} site(s) \u2014 building the consolidated Excel quote\u2026")
-            out_path = os.path.join(tmp, "consolidated_quote.xlsx")
-            fill_consolidated_quote(bills, out_path, client_name=client_name or None)
-            with open(out_path, "rb") as f:
-                excel_bytes = f.read()
-
-            status.update(label="Done", state="complete", expanded=False)
+            status.update(label=f"✅ Extracted {len(bills)} site(s)", state="complete", expanded=False)
             return {
-                "success": True,
-                "excel_bytes": excel_bytes,
-                "filename": build_consolidated_filename(client_name, bills),
                 "bills": bills,
                 "review_notes": result.get("review_notes", []),
-                "generated_at": datetime.now().strftime("%H:%M:%S"),
                 "n_sites": len(bills),
             }
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             status.update(label="Something went wrong", state="error")
             st.error(_friendly_error(e))
             with st.expander("Show technical details"):
                 st.exception(e)
             return None
+
+
+def generate_consolidated_excel(extracted_data, client_name):
+    """Phase 2: Build the Excel quote using cached NTC lookups."""
+    bills = extracted_data["bills"]
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = os.path.join(tmp, "consolidated_quote.xlsx")
+        
+        # Gather any live tariffs fetched by the user
+        tariff_overrides = {}
+        for b in bills:
+            nmi = _clean_nmi(b)
+            if nmi:
+                cached = get_cached_tariff(nmi)
+                if cached:
+                    tariff_overrides[nmi] = cached
+
+        try:
+            fill_consolidated_quote(
+                bills, 
+                out_path, 
+                client_name=client_name or None, 
+                tariff_overrides=tariff_overrides
+            )
+            with open(out_path, "rb") as f:
+                excel_bytes = f.read()
+        except Exception as e:
+            st.error(_friendly_error(e))
+            with st.expander("Show technical details"):
+                st.exception(e)
+            return None
+
+        return {
+            "success": True,
+            "excel_bytes": excel_bytes,
+            "filename": build_consolidated_filename(client_name, bills),
+            "bills": bills,
+            "review_notes": extracted_data.get("review_notes", []),
+            "generated_at": datetime.now().strftime("%H:%M:%S"),
+            "n_sites": len(bills),
+        }
+
+
+def reset_consolidated():
+    extracted = st.session_state.get("consolidated_extracted")
+    result = st.session_state.get("consolidated_result")
+    
+    # Clear out cached tariffs for all NMIs involved in this batch
+    if extracted:
+        for b in extracted["bills"]:
+            clear_cached_tariff(_clean_nmi(b))
+    elif result:
+        for b in result["bills"]:
+            clear_cached_tariff(_clean_nmi(b))
+            
+    st.session_state.update(
+        consolidated_extracted=None, 
+        consolidated_result=None, 
+        consolidated_client_name=""
+    )
 
 
 def render_consolidated_result(res: dict):
@@ -596,7 +650,56 @@ with tab_single:
                 st.rerun()
 
 with tab_consolidated:
-    if st.session_state.consolidated_result is None:
+    if st.session_state.consolidated_result is not None:
+        with st.container(border=True):
+            render_consolidated_result(st.session_state.consolidated_result)
+        st.button("\U0001F504 Process another batch", key="reset_consolidated", on_click=reset_consolidated)
+
+    elif st.session_state.consolidated_extracted is not None:
+        extracted = st.session_state.consolidated_extracted
+        client_name = st.session_state.consolidated_client_name
+
+        with st.container(border=True):
+            st.markdown(f'<div class="ok-banner">\u2705 Found {extracted["n_sites"]} site(s). Review data and fetch live tariffs below before generating the quote.</div>', unsafe_allow_html=True)
+            
+            st.markdown('<div class="section-label">Sites Overview & Tariffs</div>', unsafe_allow_html=True)
+            
+            for i, bill in enumerate(extracted["bills"], start=1):
+                label = bill.get("site_address") or bill.get("customer_name") or f"Site {i}"
+                nmi = _clean_nmi(bill)
+                
+                with st.expander(f"{i}. {label} (NMI: {nmi or 'None'})", expanded=False):
+                    render_bill_tables(bill)
+                    
+                    st.markdown('<div class="section-label" style="margin-top: 1rem;">Network Tariff Lookup</div>', unsafe_allow_html=True)
+                    if not nmi:
+                        st.caption("No NMI extracted — automated lookup suspended for this site.")
+                    else:
+                        cached = get_cached_tariff(nmi)
+                        if cached:
+                            st.markdown(f'<div class="ok-banner">\u2705 Live NTC fetched: <b>{cached}</b></div>', unsafe_allow_html=True)
+                            st.button(
+                                "\u21BA Re-fetch tariff",
+                                key=f"refetch_cons_{nmi}_{i}",
+                                on_click=lambda target=nmi: (clear_cached_tariff(target), st.rerun()),
+                            )
+                        else:
+                            st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '\u2014'}**. Click to fetch live NTC.")
+                            render_auto_lookup(nmi, key=f"multi_{nmi}_{i}")
+
+            st.markdown('<div class="section-label" style="margin-top: 2rem;">Generate Quote</div>', unsafe_allow_html=True)
+            gcol1, gcol2 = st.columns([1, 1])
+            with gcol1:
+                if st.button("\U0001F4CA Generate Consolidated Quote", type="primary", key="run_gen_consolidated"):
+                    with st.spinner("Building the Excel quote..."):
+                        res = generate_consolidated_excel(extracted, client_name)
+                        if res:
+                            st.session_state.consolidated_result = res
+                            st.rerun()
+            with gcol2:
+                st.button("\U0001F504 Start over", key="reset_cons_extracted", on_click=reset_consolidated)
+
+    else:
         with st.container(border=True):
             uploaded_files = st.file_uploader(
                 "Upload one or more bill PDFs (multi-site portfolio, or several separate bills)",
@@ -609,23 +712,16 @@ with tab_consolidated:
                 key="client_name_input",
             )
             run = st.button(
-                "Generate Consolidated Quote", type="primary", disabled=not uploaded_files, key="run_consolidated"
+                "Extract Bill Data", type="primary", disabled=not uploaded_files, key="run_consolidated"
             )
+        
         if run and uploaded_files:
             data_list = [f.getvalue() for f in uploaded_files]
             names = [f.name for f in uploaded_files]
-            res = process_consolidated(data_list, names, client_name)
-            if res:
-                st.session_state.consolidated_result = res
+            extracted = extract_consolidated(data_list, names)
+            if extracted:
+                st.session_state.consolidated_extracted = extracted
+                st.session_state.consolidated_client_name = client_name
                 st.rerun()
-    else:
-        with st.container(border=True):
-            render_consolidated_result(st.session_state.consolidated_result)
-        st.button(
-            "\U0001F504 Process another batch",
-            key="reset_consolidated",
-            on_click=lambda: st.session_state.update(consolidated_result=None),
-        )
-
 st.divider()
 st.markdown('<span class="meta-caption">Internal tool \u2014 OZ Admin Team.</span>', unsafe_allow_html=True)
