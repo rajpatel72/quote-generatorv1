@@ -345,7 +345,16 @@ def fill_consolidated_quote(bills_data: list, output_path: str, client_name: str
         nmi = bill.get("nmi_or_mirn")
         # ws[f"C{block_start}"].number_format = "@"  # keep as text: NMIs can have leading zeros
         ws[f"C{block_start}"] = str(nmi) if nmi else None
+        
+        
+        
         # ws[f"D{block_start}"] = bill.get("tariff_classification")
+        # Apply the tariff override if one was fetched for this NMI, otherwise fallback to extracted
+        extracted_tariff = bill.get("tariff_classification")
+        if tariff_overrides and nmi and str(nmi) in tariff_overrides:
+            ws[f"D{block_start}"] = tariff_overrides[str(nmi)]
+        else:
+            ws[f"D{block_start}"] = extracted_tarif
         ws[f"E{block_start}"] = bill.get("oc_number")
         ws[f"F{block_start}"] = bill.get("current_energy_retailer")
         oc = bill.get("oc_number")        
