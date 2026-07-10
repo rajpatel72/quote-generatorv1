@@ -257,7 +257,7 @@ def _reapply_block_merges(ws, block_start_row: int, total_row: int):
 # ---------------------------------------------------------------------------
    
 
-def fill_consolidated_quote(bills_data: list, output_path: str, client_name: str = None) -> str:
+def fill_consolidated_quote(bills_data: list, output_path: str, client_name: str = None, tariff_overrides: dict = None) -> str:
     """
     bills_data: list of bill dicts (same shape as excel_filler.fill_quote's
                 bill_data, one per site) — typically
@@ -354,7 +354,7 @@ def fill_consolidated_quote(bills_data: list, output_path: str, client_name: str
         if tariff_overrides and nmi and str(nmi) in tariff_overrides:
             ws[f"D{block_start}"] = tariff_overrides[str(nmi)]
         else:
-            ws[f"D{block_start}"] = extracted_tarif
+            ws[f"D{block_start}"] = extracted_tariff
         ws[f"E{block_start}"] = bill.get("oc_number")
         ws[f"F{block_start}"] = bill.get("current_energy_retailer")
         oc = bill.get("oc_number")        
