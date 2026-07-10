@@ -115,6 +115,7 @@ INDEX_HTML_CONTENT = """<!DOCTYPE html>
     });
 
     window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 90 }, "*");
   </script>
 </body>
 </html>
