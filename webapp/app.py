@@ -34,6 +34,7 @@ from single_excel_filler import fill_quote
 from consolidated_gemini_client import extract_consolidated_bills
 from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
+from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff
 
 st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="centered")
 
@@ -126,6 +127,7 @@ if not GEMINI_API_KEY:
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+st.session_state.setdefault("single_extracted", None)
 st.session_state.setdefault("single_result", None)
 st.session_state.setdefault("consolidated_result", None)
 
@@ -254,13 +256,22 @@ def render_bill_tables(data: dict, heading: str | None = None):
 # ---------------------------------------------------------------------------
 # Single-site pipeline
 # ---------------------------------------------------------------------------
-def process_single(pdf_bytes: bytes, filename: str):
+def _clean_nmi(data: dict) -> str | None:
+    nmi = data.get("nmi_or_mirn")
+    nmi = str(nmi).strip() if nmi else ""
+    return nmi or None
+
+
+def extract_single(pdf_bytes: bytes, filename: str):
+    """Phase 1: Gemini extraction only. Splitting this out from Excel
+    generation is what makes the NMI tariff lookup possible - the NMI has
+    to be known (and confirmable/overridable) before the quote is built."""
     with tempfile.TemporaryDirectory() as tmp:
         pdf_path = os.path.join(tmp, filename)
         with open(pdf_path, "wb") as f:
             f.write(pdf_bytes)
 
-        status = st.status("Processing bill\u2026", expanded=True)
+        status = st.status("Reading bill\u2026", expanded=True)
         try:
             status.write("\U0001F4E4 Analyzing bill for data extraction (this can take up to a minute)\u2026")
             result = extract_bill(pdf_path, api_keys=API_KEYS)
@@ -271,23 +282,16 @@ def process_single(pdf_bytes: bytes, filename: str):
                 _show_model_errors(result["model_errors"])
                 return None
 
-            status.write("\u2705 Extraction complete \u2014 cross-checking the two models' answers\u2026")
-            status.write("\U0001F4CA Building the Excel quote\u2026")
-            out_path = os.path.join(tmp, "generated_quote.xlsx")
-            fill_quote(result["data"], out_path)
-            with open(out_path, "rb") as f:
-                excel_bytes = f.read()
-
-            status.update(label="Done", state="complete", expanded=False)
+            status.update(
+                label="\u2705 Extraction complete \u2014 cross-checked the two models' answers",
+                state="complete",
+                expanded=False,
+            )
             return {
-                "success": True,
-                "excel_bytes": excel_bytes,
-                "filename": build_single_filename(result["data"].get("site_address")),
-                "source_filename": filename,
                 "data": result["data"],
                 "review_fields": result["review_fields"],
                 "degraded_mode": result.get("degraded_mode", False),
-                "generated_at": datetime.now().strftime("%H:%M:%S"),
+                "source_filename": filename,
             }
         except Exception as e:  # noqa: BLE001
             status.update(label="Something went wrong", state="error")
@@ -295,6 +299,54 @@ def process_single(pdf_bytes: bytes, filename: str):
             with st.expander("Show technical details"):
                 st.exception(e)
             return None
+
+
+def generate_single_excel(extracted: dict, tariff_override: str | None):
+    """Phase 2: build the Excel quote from already-extracted data, using the
+    live-looked-up NTC (if any) instead of whatever tariff Gemini read off
+    the bill text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = os.path.join(tmp, "generated_quote.xlsx")
+        tariff_debug: dict = {}
+        try:
+            with st.spinner("\U0001F4CA Building the Excel quote\u2026"):
+                fill_quote(
+                    extracted["data"],
+                    out_path,
+                    tariff_debug=tariff_debug,
+                    tariff_override=tariff_override,
+                )
+                with open(out_path, "rb") as f:
+                    excel_bytes = f.read()
+        except Exception as e:  # noqa: BLE001
+            st.error(_friendly_error(e))
+            with st.expander("Show technical details"):
+                st.exception(e)
+            return None
+
+        return {
+            "success": True,
+            "excel_bytes": excel_bytes,
+            "filename": build_single_filename(extracted["data"].get("site_address")),
+            "source_filename": extracted["source_filename"],
+            "data": extracted["data"],
+            "review_fields": extracted["review_fields"],
+            "degraded_mode": extracted["degraded_mode"],
+            "tariff_debug": tariff_debug,
+            "generated_at": datetime.now().strftime("%H:%M:%S"),
+        }
+
+
+def reset_single():
+    extracted = st.session_state.get("single_extracted")
+    result = st.session_state.get("single_result")
+    nmi = None
+    if extracted:
+        nmi = _clean_nmi(extracted["data"])
+    elif result:
+        nmi = _clean_nmi(result["data"])
+    clear_cached_tariff(nmi)
+    st.session_state.update(single_extracted=None, single_result=None)
 
 
 def render_single_result(res: dict):
@@ -315,6 +367,12 @@ def render_single_result(res: dict):
         )
 
     render_bill_tables(res["data"], heading="Extracted Bill Data")
+
+    tariff_debug = res.get("tariff_debug") or {}
+    if tariff_debug.get("source") == "browser_popup_override":
+        st.caption(f"\u26A1 Tariff on this quote (B16): **{tariff_debug.get('tariff')}** \u2014 live lookup from the portal.")
+    else:
+        st.caption("\u2139\uFE0F Tariff on this quote (B16) came from the bill text \u2014 no live lookup was used, so double-check it.")
 
     st.markdown('<div class="section-label">Download</div>', unsafe_allow_html=True)
     st.download_button(
@@ -461,23 +519,81 @@ st.markdown(
 tab_single, tab_consolidated = st.tabs(["\U0001F4C4 Single Site", "\U0001F3E2 Consolidated / Multi-site"])
 
 with tab_single:
-    if st.session_state.single_result is None:
-        with st.container(border=True):
-            uploaded = st.file_uploader("Upload one bill PDF", type=["pdf"], key="single_uploader")
-            run = st.button("Generate Quote", type="primary", disabled=uploaded is None, key="run_single")
-        if run and uploaded:
-            res = process_single(uploaded.getvalue(), uploaded.name)
-            if res:
-                st.session_state.single_result = res
-                st.rerun()
-    else:
+    if st.session_state.single_result is not None:
         with st.container(border=True):
             render_single_result(st.session_state.single_result)
-        st.button(
-            "\U0001F504 Process another bill",
-            key="reset_single",
-            on_click=lambda: st.session_state.update(single_result=None),
-        )
+        st.button("\U0001F504 Process another bill", key="reset_single", on_click=reset_single)
+
+    elif st.session_state.single_extracted is not None:
+        extracted = st.session_state.single_extracted
+        nmi = _clean_nmi(extracted["data"])
+
+        with st.container(border=True):
+            if extracted.get("degraded_mode"):
+                st.warning(
+                    "\u26A0\uFE0F Only one model returned a result for this bill \u2014 it wasn't cross-checked "
+                    "against a second opinion. Please review the figures carefully."
+                )
+            if extracted["review_fields"]:
+                st.markdown(f"**\u26A0\uFE0F {len(extracted['review_fields'])} field(s) need a manual double-check:**")
+                for f in extracted["review_fields"]:
+                    st.markdown(f'<div class="field-flag">{f}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div class="ok-banner">\u2705 Both models agreed on every field \u2014 high confidence extraction.</div>',
+                    unsafe_allow_html=True,
+                )
+
+            render_bill_tables(extracted["data"], heading="Extracted Bill Data")
+
+            st.markdown('<div class="section-label">Network Tariff (NTC) Lookup</div>', unsafe_allow_html=True)
+            if not nmi:
+                st.caption(
+                    "No NMI/MIRN was extracted from this bill, so a live tariff lookup isn't possible \u2014 "
+                    "the quote will use the tariff printed on the bill."
+                )
+            else:
+                cached_tariff = get_cached_tariff(nmi)
+                if cached_tariff:
+                    st.markdown(
+                        f'<div class="ok-banner">\u2705 Live NTC fetched for NMI {nmi}: <b>{cached_tariff}</b> '
+                        f'\u2014 this will be used on the quote instead of the bill\'s printed tariff.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.button(
+                        "\u21BA Re-fetch tariff",
+                        key="refetch_tariff_single",
+                        on_click=lambda: (clear_cached_tariff(nmi), st.rerun()),
+                    )
+                else:
+                    st.caption(
+                        f"Bill shows tariff **{extracted['data'].get('tariff_classification') or '\u2014'}** for NMI **{nmi}**. "
+                        "Click below to fetch the live network tariff from the sales portal (opens in a new tab \u2014 "
+                        "requires the GloBird NTC Fetcher Tampermonkey script and an active portal login)."
+                    )
+                    render_auto_lookup(nmi, key="single")
+
+            st.markdown('<div class="section-label">Generate Quote</div>', unsafe_allow_html=True)
+            gcol1, gcol2 = st.columns([1, 1])
+            with gcol1:
+                if st.button("\U0001F4CA Generate Excel Quote", type="primary", key="run_generate_single"):
+                    tariff_override = get_cached_tariff(nmi)
+                    res = generate_single_excel(extracted, tariff_override)
+                    if res:
+                        st.session_state.single_result = res
+                        st.rerun()
+            with gcol2:
+                st.button("\U0001F504 Start over", key="reset_single_extracted", on_click=reset_single)
+
+    else:
+        with st.container(border=True):
+            uploaded = st.file_uploader("Upload one bill PDF", type=["pdf"], key="single_uploader")
+            run = st.button("Extract Bill Data", type="primary", disabled=uploaded is None, key="run_single")
+        if run and uploaded:
+            extracted = extract_single(uploaded.getvalue(), uploaded.name)
+            if extracted:
+                st.session_state.single_extracted = extracted
+                st.rerun()
 
 with tab_consolidated:
     if st.session_state.consolidated_result is None:
