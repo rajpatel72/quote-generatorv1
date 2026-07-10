@@ -1,5 +1,0 @@
-streamlit>=1.38
-google-genai>=0.3.0
-pydantic>=2.6
-openpyxl>=3.1
-pypdf>=4.0
