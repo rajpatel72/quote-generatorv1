@@ -1,138 +1,210 @@
 """
-Bridges the UConX Tampermonkey userscript (see uconx-tariff-grabber.user.js)
-back into this Streamlit app.
-
-Why this exists: a popup window is a different origin than the Streamlit
-app, so plain JS in the app can never read the popup's content directly
-(Same-Origin Policy). The userscript solves that by running *inside* the
-UConX page and using window.postMessage to hand the value back across the
-origin boundary - postMessage is explicitly designed to be safe for that.
-
-The remaining wrinkle: Streamlit itself has no live JS -> Python channel
-outside of a full custom-component build. So once our JS receives the
-postMessage, it navigates the top-level page with the result as a URL
-query param, which triggers a normal Streamlit rerun - and on that rerun,
-consume_incoming_tariff() (called from app.py) picks the value up from
-st.query_params and stores it in session_state, keyed by NMI, then strips
-it from the URL so it can't be reapplied on later reruns.
-
-REQUIRES: the companion Tampermonkey (or similar) userscript installed in
-the browser doing the lookup. Without it, the popup opens normally but
-nothing gets sent back - the manual "look at the page and paste the value"
-fallback is preserved for anyone who hasn't installed it.
+Bridges the "GloBird NMI NTC Fetcher" Tampermonkey userscript back into this Streamlit app.
 """
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 
-LOOKUP_URL_TEMPLATE = "https://firstenergy.uconx.com.au/agent/tools/get-address-and-meter-data?nmi={nmi}"
+# Any page on this origin will do - the userscript's @match takes care of
+# running there, reads `ntc_lookup_nmi` off the URL, and does the rest.
+LOOKUP_URL_TEMPLATE = "https://globird-salesportal.azurewebsites.net/?ntc_lookup_nmi={nmi}"
 
-_QP_TARIFF = "auto_tariff"
-_QP_NMI = "auto_tariff_nmi"
+_MESSAGE_TYPE = "globird-ntc-lookup-result"
+
 _SESSION_KEY = "auto_tariff_by_nmi"
+_DEBUG_SESSION_KEY = "auto_tariff_debug_by_nmi"
+
+# ---------------------------------------------------------------------------
+# DYNAMIC NATIVE CUSTOM COMPONENT SETUP
+# This safely escapes Streamlit's iframe sandbox restrictions by communicating
+# directly over Streamlit's internal WebSocket channel rather than altering URLs.
+# ---------------------------------------------------------------------------
+COMPONENT_DIR = os.path.join(os.path.dirname(__file__), "ntc_lookup_component")
+if not os.path.exists(COMPONENT_DIR):
+    os.makedirs(COMPONENT_DIR)
+
+INDEX_HTML_CONTENT = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; padding: 0; font-family: sans-serif; overflow: hidden; background: transparent; }
+    .status-box {
+      color: #EC1B40; font-size: 0.88rem; font-weight: 600; padding: 0.6rem; 
+      background: rgba(236, 27, 64, 0.04); border: 1px dashed rgba(236, 27, 64, 0.3); 
+      border-radius: 8px; box-sizing: border-box; width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="status" class="status-box">⚡ Click button to lookup NMI...</div>
+  <button id="lookup-btn" style="cursor:pointer; width:100%; padding: 8px; border-radius: 4px; background: #EC1B40; color: white; border: none;">
+    Open Portal to Fetch NTC
+  </button>
+
+  <script>
+    let nmi = "";
+    let lookupUrlTemplate = "";
+    let messageType = "";
+    let popupRef = null;
+    let popupCheckInterval = null;
+
+    window.addEventListener("message", function(event) {
+      if (event.data.type === "streamlit:render") {
+        nmi = event.data.args.nmi;
+        lookupUrlTemplate = event.data.args.lookup_url_template;
+        messageType = event.data.args.message_type;
+      }
+    });
+
+    function resetToRetry(message) {
+      if (popupCheckInterval) {
+        clearInterval(popupCheckInterval);
+        popupCheckInterval = null;
+      }
+      document.getElementById("status").textContent = message;
+      document.getElementById("lookup-btn").style.display = "block";
+      document.getElementById("lookup-btn").textContent = "Retry: Open Portal to Fetch NTC";
+    }
+
+    document.getElementById("lookup-btn").onclick = function() {
+      const popupUrl = lookupUrlTemplate.replace("{nmi}", nmi);
+
+      // IMPORTANT: do NOT pass "noopener" here. The userscript running in
+      // the popup sends its result back via `window.opener.postMessage(...)`.
+      // "noopener" sets window.opener to null in the popup, which silently
+      // breaks that entirely (the userscript just gives up with no error
+      // visible in this tab) - this was the root cause of lookups never
+      // coming back.
+      const popup = window.open(popupUrl, "_blank", "width=1000,height=750");
+
+      if (!popup) {
+        document.getElementById("status").textContent = "⚠️ Popup blocked! Please allow popups for this site and try again.";
+        return;
+      }
+
+      popupRef = popup;
+      document.getElementById("status").textContent = "Waiting for data from portal (a new tab just opened)...";
+      document.getElementById("lookup-btn").style.display = "none";
+
+      // Safety net: if the person closes the portal tab (or it fails to
+      // load / the userscript isn't installed) before it ever sends data
+      // back, don't leave this stuck on "Waiting..." forever - flip back
+      // to a retry state.
+      popupCheckInterval = setInterval(function() {
+        if (popup.closed) {
+          resetToRetry("⚠️ The portal tab was closed before it finished. Click below to try again.");
+        }
+      }, 800);
+    };
+
+    // Listen for data from the popup
+    window.addEventListener("message", function(event) {
+      if (event.data && event.data.type === messageType && String(event.data.nmi) === String(nmi)) {
+        if (popupCheckInterval) {
+          clearInterval(popupCheckInterval);
+          popupCheckInterval = null;
+        }
+        document.getElementById("status").textContent = "✅ NTC received - updating...";
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value: { ntc: event.data.ntc, nmi: nmi }
+        }, "*");
+      }
+    });
+
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+  </script>
+</body>
+</html>
+"""
+
+# Write component HTML dynamically at runtime
+with open(os.path.join(COMPONENT_DIR, "index.html"), "w", encoding="utf-8") as f:
+    f.write(INDEX_HTML_CONTENT)
+
+# Declare component inside Streamlit architecture
+_ntc_lookup_component = components.declare_component("ntc_lookup_component", path=COMPONENT_DIR)
 
 
+# ---------------------------------------------------------------------------
+# BACKWARD COMPATIBLE INTERFACES FOR APP.PY
+# ---------------------------------------------------------------------------
 def consume_incoming_tariff() -> None:
-    """
-    Call once near the top of the script, before rendering any UI, on
-    every rerun. If the browser just navigated back from the popup flow
-    with a tariff result in the URL, stash it in session_state (keyed by
-    NMI) and strip those two params from the URL so a later rerun (e.g.
-    clicking "process another bill") doesn't reapply a stale value.
-    """
-    params = st.query_params
-    tariff = params.get(_QP_TARIFF)
-    nmi = params.get(_QP_NMI)
-    if tariff and nmi:
-        st.session_state.setdefault(_SESSION_KEY, {})
-        st.session_state[_SESSION_KEY][nmi] = tariff
-        del params[_QP_TARIFF]
-        del params[_QP_NMI]
+    """Kept as a functional stub so app.py doesn't crash if called."""
+    pass
 
 
 def get_cached_tariff(nmi: str | None) -> str | None:
-    """Returns the most recent auto-looked-up tariff for this NMI, if any."""
+    """Returns the most recent auto-looked-up NTC for this NMI, if any."""
     if not nmi:
         return None
     return st.session_state.get(_SESSION_KEY, {}).get(str(nmi))
 
 
-def render_lookup_button(nmi: str | None, key: str) -> None:
+def get_cached_tariff_debug(nmi: str | None) -> dict | None:
+    """Returns the diagnostic info recorded alongside the cached NTC, if any."""
+    if not nmi:
+        return None
+    return st.session_state.get(_DEBUG_SESSION_KEY, {}).get(str(nmi))
+
+
+def clear_cached_tariff(nmi: str | None) -> None:
+    """Drops any cached auto-lookup value for this NMI."""
+    if not nmi:
+        return
+    st.session_state.get(_SESSION_KEY, {}).pop(str(nmi), None)
+    st.session_state.get(_DEBUG_SESSION_KEY, {}).pop(str(nmi), None)
+
+
+def render_lookup_button(nmi: str | None, key: str = "auto") -> None:
     """
-    Renders a button that opens the UConX lookup page for `nmi` in a
-    popup. If the userscript is installed, the result comes back
-    automatically (the page will visibly reload once it arrives - that's
-    the query-param rerun, not an error). If it isn't installed, the
-    popup just opens normally and the person can read the value off the
-    page and enter it manually elsewhere in the UI.
+    Renders the custom lookup automation interface. Receives the data values 
+    from JavaScript execution natively and assigns them directly to session state.
     """
     if not nmi:
-        st.caption("No NMI was extracted from this bill, so auto-lookup isn't available.")
+        st.caption("No NMI extracted — automated lookup suspended.")
         return
 
-    url = LOOKUP_URL_TEMPLATE.format(nmi=nmi)
-    html = f"""
-    <div style="font-family: 'Space Grotesk', sans-serif;">
-      <button id="lookup-btn-{key}" style="
-          padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ccc;
-          background: #fff; cursor: pointer; font-size: 0.9rem;">
-        \U0001F50D Auto-lookup Network Tariff
-      </button>
-      <span id="lookup-status-{key}" style="margin-left: 0.6rem; color: #666; font-size: 0.85rem;"></span>
-    </div>
-    <script>
-      (function() {{
-        const btn = document.getElementById("lookup-btn-{key}");
-        const status = document.getElementById("lookup-status-{key}");
+    # Check if we already have a cached tariff for this NMI to prevent reloading loops
+    if get_cached_tariff(nmi):
+        return
 
-        btn.addEventListener("click", function() {{
-          status.textContent = "Opening UConX in a popup\u2026";
+    # Run the native component and capture any values returned by JS window.parent.postMessage
+    component_result = _ntc_lookup_component(
+        nmi=nmi,
+        lookup_url_template=LOOKUP_URL_TEMPLATE,
+        message_type=_MESSAGE_TYPE,
+        key=f"ntc_comp_{key}_{nmi}"
+    )
 
-          // This iframe is sandboxed by Streamlit and can't reliably
-          // navigate window.top itself once we're outside the original
-          // click's brief activation window (that's why the old version
-          // silently failed here). Instead, the userscript running in the
-          // popup does the navigation - it's a normal, unsandboxed tab, so
-          // it can navigate its opener's top window directly, the same
-          // way OAuth popups redirect their opener on completion.
-          // It can't read this tab's URL itself (cross-origin), so we hand
-          // it over now, while we're still same-origin and mid-click.
-          const returnTo = window.top.location.origin + window.top.location.pathname;
-          const popupUrl = "{url}" + "&return_to=" + encodeURIComponent(returnTo);
-          const popup = window.open(popupUrl, "uconxLookup_{key}", "width=900,height=700");
+    # Process data instantly when streamed back from the JavaScript frame
+    if component_result and isinstance(component_result, dict):
+        ntc = component_result.get("ntc")
+        returned_nmi = component_result.get("nmi")
 
-          if (!popup) {{
-            status.textContent = "Popup was blocked \u2014 allow popups for this site and try again.";
-            return;
-          }}
+        if ntc and returned_nmi:
+            st.session_state.setdefault(_SESSION_KEY, {})
+            st.session_state[_SESSION_KEY][str(returned_nmi)] = ntc
+            st.session_state.setdefault(_DEBUG_SESSION_KEY, {})
+            st.session_state[_DEBUG_SESSION_KEY][str(returned_nmi)] = {
+                "matched": True,
+                "source": "globird_ntc_lookup",
+                "tariff": ntc,
+            }
+            # Issue a clean Python rerun to refresh state variables and process your tool pipeline
+            st.rerun()
 
-          let settled = false;
-          status.textContent = "Waiting for the userscript to find the tariff \u2014 " +
-                                "this page will refresh automatically once it does\u2026";
+def persist_single_bill(nmi: str | None, result: dict) -> None:
+    """Stub to prevent app.py from crashing if called."""
+    pass
 
-          function handleMessage(event) {{
-            if (!event.data || event.data.type !== "uconx-nmi-tariff-result") return;
-            if (String(event.data.nmi) !== "{nmi}") return;
-            settled = true;
-            window.removeEventListener("message", handleMessage);
+def persist_consolidated_bill(result: dict) -> None:
+    """Stub to prevent app.py from crashing if called."""
+    pass
 
-            if (!event.data.tariff) {{
-              status.textContent = "Userscript ran but found no tariff on the page \u2014 check it manually.";
-            }}
-            // On success the popup navigates this tab and closes itself
-            // directly - there's nothing left to do here.
-          }}
-          window.addEventListener("message", handleMessage);
-
-          // If nothing comes back in 15s, the userscript probably isn't
-          // installed - let the person know instead of waiting forever.
-          setTimeout(function() {{
-            if (!settled) {{
-              status.textContent = "No response yet \u2014 is the Tampermonkey script installed and enabled? " +
-                                    "You can still read the value off the popup and enter it manually.";
-            }}
-          }}, 15000);
-        }});
-      }})();
-    </script>
-    """
-    components.html(html, height=50)
+# Add this at the end of tariff_bridge.py
+def render_auto_lookup(nmi: str | None, key: str = "auto") -> None:
+    """Alias for render_lookup_button to maintain compatibility with app.py."""
+    render_lookup_button(nmi, key=key)
