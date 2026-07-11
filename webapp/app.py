@@ -35,6 +35,13 @@ from consolidated_gemini_client import extract_consolidated_bills
 from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
 from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff, render_bulk_lookup_button
+from retailer_rates import build_proposed_charges
+
+# Path to the retailer rate-comparison workbook used to price the "New
+# Proposed Offer" columns. Adjust this if you keep it somewhere other than
+# alongside app.py (e.g. under template/, same convention as
+# single_excel_filler.TEMPLATE_PATH).
+COMPARISON_PATH = os.path.join(os.path.dirname(__file__), "Master_Retailers_Comparison.xlsx")
 
 st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="centered")
 
@@ -311,6 +318,26 @@ def generate_single_excel(extracted: dict, tariff_override: str | None):
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "generated_quote.xlsx")
         tariff_debug: dict = {}
+
+        # The live NTC (if we have one) also drives the New Proposed Offer
+        # lookup - falls back to the bill's own printed tariff so the
+        # section still populates (flagged via offer_meta["match_level"] /
+        # ntc_source below) rather than being silently skipped.
+        ntc_for_offer = tariff_override or extracted["data"].get("tariff_classification")
+        proposed_charges, offer_meta = (None, {})
+        if ntc_for_offer:
+            try:
+                proposed_charges, offer_meta = build_proposed_charges(
+                    extracted["data"], ntc_for_offer, COMPARISON_PATH
+                )
+                offer_meta["ntc_source"] = "live_lookup" if tariff_override else "bill_text"
+            except Exception as e:  # noqa: BLE001
+                # A pricing miss shouldn't block quote generation - the New
+                # Proposed Offer columns just stay blank, same as an
+                # unmatched charge line.
+                offer_meta = {"error": str(e)}
+                proposed_charges = None
+
         try:
             with st.spinner("\U0001F4CA Building the Excel quote\u2026"):
                 fill_quote(
@@ -318,6 +345,7 @@ def generate_single_excel(extracted: dict, tariff_override: str | None):
                     out_path,
                     tariff_debug=tariff_debug,
                     tariff_override=tariff_override,
+                    proposed_charges=proposed_charges,
                 )
                 with open(out_path, "rb") as f:
                     excel_bytes = f.read()
@@ -336,6 +364,7 @@ def generate_single_excel(extracted: dict, tariff_override: str | None):
             "review_fields": extracted["review_fields"],
             "degraded_mode": extracted["degraded_mode"],
             "tariff_debug": tariff_debug,
+            "offer_meta": offer_meta,
             "generated_at": datetime.now().strftime("%H:%M:%S"),
         }
 
@@ -376,6 +405,25 @@ def render_single_result(res: dict):
         st.caption(f"\u26A1 Tariff on this quote (B16): **{tariff_debug.get('tariff')}** \u2014 live lookup from the portal.")
     else:
         st.caption("\u2139\uFE0F Tariff on this quote (B16) came from the bill text \u2014 no live lookup was used, so double-check it.")
+
+    offer_meta = res.get("offer_meta") or {}
+    if offer_meta.get("error"):
+        st.caption(f"\u26A0\uFE0F New Proposed Offer wasn't priced: {offer_meta['error']}")
+    elif offer_meta.get("retailer"):
+        saving = offer_meta.get("estimated_saving")
+        saving_txt = f" \u2014 est. saving vs current bill: **{saving:,.2f}**" if isinstance(saving, (int, float)) else ""
+        source_txt = "live NTC" if offer_meta.get("ntc_source") == "live_lookup" else "bill's printed tariff (no live NTC)"
+        st.caption(
+            f"\U0001F4A1 New Proposed Offer: **{offer_meta['retailer']}** on tariff **{offer_meta.get('tariff_code')}** "
+            f"(matched via {offer_meta.get('match_level')}, using {source_txt}){saving_txt}."
+        )
+        if offer_meta.get("unmatched_descriptions"):
+            st.caption(
+                f"\u26A0\uFE0F Left blank on the New Proposed Offer side (couldn't classify): "
+                f"{', '.join(offer_meta['unmatched_descriptions'])}"
+            )
+    elif ntc_for_offer_display := (tariff_debug.get("tariff") or res["data"].get("tariff_classification")):
+        st.caption(f"\u2139\uFE0F No matching retailer offer found in the comparison sheet for tariff {ntc_for_offer_display}.")
 
     st.markdown('<div class="section-label">Download</div>', unsafe_allow_html=True)
     st.download_button(
