@@ -34,7 +34,7 @@ from single_excel_filler import fill_quote
 from consolidated_gemini_client import extract_consolidated_bills
 from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
-from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff
+from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff, render_bulk_lookup_button
 
 st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="centered")
 
