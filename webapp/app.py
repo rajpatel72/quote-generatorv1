@@ -90,66 +90,69 @@ st.markdown(
         --canvas: #F4F6FB;
     }
 
-    html, body, [class*="css"] { font-family: 'Inter', 'Space Grotesk', sans-serif; color: var(--ink); }
+    html, body { font-family: 'Inter', 'Space Grotesk', sans-serif; }
+    p, span, label, li, div { font-family: 'Inter', 'Space Grotesk', sans-serif; }
 
     .stApp { background: var(--canvas); }
-    .block-container { padding-top: 2.4rem; padding-bottom: 3rem; max-width: 1080px; margin: 0 auto; }
+    .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1080px; margin: 0 auto; }
 
     /* ---- Header ---- */
-    .app-header { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 0.2rem; }
-    .app-header img { border-radius: 8px; }
     .hero-badge {
         display: inline-block; padding: 0.22rem 0.8rem; border-radius: 999px;
         background: var(--accent-soft); border: 1px solid rgba(196, 18, 58, 0.28);
-        color: var(--accent); font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em;
+        color: var(--accent) !important; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em;
         text-transform: uppercase; margin-bottom: 0.65rem;
     }
     .hero-title {
         font-family: 'Space Grotesk', sans-serif;
-        font-size: 2.05rem; font-weight: 700; line-height: 1.15; margin: 0;
-        color: var(--navy);
+        font-size: 2.05rem; font-weight: 700; line-height: 1.15; margin: 0.1rem 0 0 0;
+        color: var(--navy) !important;
         letter-spacing: -0.01em;
     }
-    .hero-sub { color: var(--ink-soft); font-size: 0.95rem; margin: 0.5rem 0 1.6rem 0; line-height: 1.55; }
+    .hero-sub { color: var(--ink-soft) !important; font-size: 0.95rem; margin: 0.6rem 0 1.5rem 0; line-height: 1.6; }
     .hero-sub ul { margin: 0; padding-left: 1.1rem; }
-    .hero-sub li { margin-bottom: 0.15rem; }
+    .hero-sub li { margin-bottom: 0.2rem; color: var(--ink-soft) !important; }
 
     /* ---- Section labels ---- */
     .section-label {
         display: flex; align-items: center; gap: 0.5rem;
         font-size: 0.72rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
-        color: var(--navy-2); margin: 1.3rem 0 0.55rem 0;
+        color: var(--navy-2) !important; margin: 1.4rem 0 0.6rem 0;
     }
     .section-label::before {
         content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
-        background: var(--accent);
+        background: var(--accent); flex-shrink: 0;
     }
-    .meta-caption { color: #7A84A0; font-size: 0.8rem; }
+    .meta-caption { color: #7A84A0 !important; font-size: 0.8rem; }
 
     /* ---- Status banners ---- */
     .field-flag {
         background: var(--warn-soft); border: 1px solid rgba(255, 193, 7, 0.4);
-        color: var(--warn); border-radius: 10px; padding: 0.55rem 0.9rem; margin-bottom: 0.4rem;
+        color: var(--warn) !important; border-radius: 10px; padding: 0.55rem 0.9rem; margin-bottom: 0.4rem;
         font-size: 0.88rem;
     }
     .ok-banner {
         background: var(--good-soft); border: 1px solid rgba(46, 204, 113, 0.35);
-        color: var(--good); border-radius: 10px; padding: 0.65rem 1rem; font-size: 0.9rem;
+        color: var(--good) !important; border-radius: 10px; padding: 0.65rem 1rem; font-size: 0.9rem;
         margin-bottom: 0.7rem;
     }
     .info-banner {
         background: rgba(35, 64, 122, 0.06); border: 1px solid rgba(35, 64, 122, 0.18);
-        color: var(--navy-2); border-radius: 10px; padding: 0.6rem 0.9rem; font-size: 0.88rem;
+        color: var(--navy-2) !important; border-radius: 10px; padding: 0.6rem 0.9rem; font-size: 0.88rem;
         margin-bottom: 0.6rem;
     }
+    .field-flag *, .ok-banner *, .info-banner * { color: inherit !important; }
 
-    /* ---- Cards (bordered containers) ---- */
+    /* ---- Cards (top-level bordered containers only) ---- */
     [data-testid="stVerticalBlockBorderWrapper"] {
         background: var(--card);
         border: 1px solid var(--line) !important;
         border-radius: 16px !important;
         box-shadow: 0 1px 2px rgba(16, 25, 46, 0.03), 0 8px 24px rgba(16, 25, 46, 0.035);
-        padding: 0.25rem 0.25rem;
+    }
+    /* prevent a bordered container from ever nesting its own shadow/border again */
+    [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stVerticalBlockBorderWrapper"] {
+        box-shadow: none;
     }
 
     /* ---- Tabs as a quiet segmented control ---- */
@@ -159,24 +162,33 @@ st.markdown(
     }
     .stTabs [data-baseweb="tab"] {
         height: 2.5rem; border-radius: 9px; font-weight: 600; font-size: 0.9rem;
-        color: var(--ink-soft); background: transparent;
+        color: var(--ink-soft) !important; background: transparent;
     }
+    .stTabs [data-baseweb="tab"] p { color: inherit !important; }
     .stTabs [aria-selected="true"] {
-        background: var(--card) !important; color: var(--navy) !important;
+        background: var(--card) !important;
         box-shadow: 0 1px 3px rgba(16, 25, 46, 0.08);
     }
+    .stTabs [aria-selected="true"] p { color: var(--navy) !important; }
 
     /* ---- Buttons ---- */
     .stButton > button, .stDownloadButton > button {
         border-radius: 10px; font-weight: 600; letter-spacing: 0.01em;
         border: 1px solid var(--line);
+        color: var(--ink) !important;
     }
+    .stButton > button p, .stDownloadButton > button p { color: inherit !important; }
     .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
         background: linear-gradient(135deg, var(--navy), var(--navy-2));
         border: none;
+        color: #FFFFFF !important;
     }
     .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
-        filter: brightness(1.08);
+        filter: brightness(1.12);
+        color: #FFFFFF !important;
+    }
+    .stButton > button[kind="secondary"]:hover, .stDownloadButton > button[kind="secondary"]:hover {
+        border-color: var(--navy-2); color: var(--navy-2) !important;
     }
 
     /* ---- Metrics ---- */
@@ -184,26 +196,43 @@ st.markdown(
         background: rgba(16, 25, 46, 0.025); border: 1px solid var(--line);
         border-radius: 12px; padding: 0.7rem 0.9rem 0.5rem 0.9rem;
     }
-    [data-testid="stMetricLabel"] { color: var(--ink-soft); font-size: 0.78rem; }
+    [data-testid="stMetricLabel"] { color: var(--ink-soft) !important; font-size: 0.78rem; }
+    [data-testid="stMetricValue"] { color: var(--ink) !important; }
 
-    /* ---- Rate comparison: Current / New offer panels ---- */
+    /* ---- Rate comparison: Current / New offer panels ----
+       Scoped via st.container(key=...), which Streamlit >=1.32 renders as
+       a stable `st-key-<key>` class -- far more reliable than guessing at
+       internal testids, and immune to nested-card doubling since these
+       panels never use container(border=True) themselves. */
+    div[class*="st-key-cmp-current-"] {
+        border: 1px solid #E0A46B; border-radius: 12px; padding: 0.75rem 0.85rem 0.5rem 0.85rem;
+        background: #FFFDFB;
+    }
+    div[class*="st-key-cmp-new-"] {
+        border: 1px solid #8FC46B; border-radius: 12px; padding: 0.75rem 0.85rem 0.5rem 0.85rem;
+        background: #FBFEFA;
+    }
     .offer-header {
         text-align: center; font-weight: 700; font-size: 0.92rem;
-        padding: 0.55rem 0.5rem; border-radius: 9px; margin-bottom: 0.5rem;
+        padding: 0.55rem 0.5rem; border-radius: 8px; margin-bottom: 0.5rem;
     }
-    .offer-header.current { background: #F6C69A; color: #7A3D00; }
-    .offer-header.new { background: #B8E0A0; color: #1F5C0B; }
+    .offer-header.current { background: #F6C69A; color: #7A3D00 !important; }
+    .offer-header.new { background: #B8E0A0; color: #1F5C0B !important; }
+    .offer-header * { color: inherit !important; }
     .offer-gst-note {
         text-align: center; font-style: italic; font-size: 0.78rem;
-        color: var(--ink-soft); margin: -0.15rem 0 0.5rem 0;
+        color: var(--ink-soft) !important; margin: -0.15rem 0 0.5rem 0;
     }
     .offer-total-bar {
         display: flex; justify-content: space-between; align-items: center;
         font-weight: 700; font-size: 0.92rem; padding: 0.55rem 0.9rem;
-        border-radius: 9px; margin-top: 0.5rem;
+        border-radius: 8px; margin-top: 0.6rem;
     }
-    .offer-total-bar.current { background: #F6C69A; color: #7A3D00; }
-    .offer-total-bar.new { background: #B8E0A0; color: #1F5C0B; }
+    .offer-total-bar.current { background: #F6C69A; color: #7A3D00 !important; }
+    .offer-total-bar.new { background: #B8E0A0; color: #1F5C0B !important; }
+    .offer-total-bar * { color: inherit !important; }
+    .offer-row-controls { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
+    .offer-row-controls .stButton > button { width: 100%; font-size: 0.82rem; padding: 0.3rem 0.5rem; }
 
     /* ---- Misc ---- */
     div[data-testid="stStatusWidget"] { border-radius: 12px; }
