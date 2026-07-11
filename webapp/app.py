@@ -35,7 +35,7 @@ from consolidated_gemini_client import extract_consolidated_bills
 from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
 from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff, render_bulk_lookup_button
-from retailer_rates import build_proposed_charges
+from retailer_rates import build_proposed_charges, retailer_color_hex
 
 # Path to the retailer rate-comparison workbook used to price the "New
 # Proposed Offer" columns. Adjust this if you keep it somewhere other than
@@ -346,6 +346,7 @@ def generate_single_excel(extracted: dict, tariff_override: str | None):
                     tariff_debug=tariff_debug,
                     tariff_override=tariff_override,
                     proposed_charges=proposed_charges,
+                    proposed_retailer_color=retailer_color_hex(offer_meta.get("retailer")),
                 )
                 with open(out_path, "rb") as f:
                     excel_bytes = f.read()
