@@ -225,7 +225,7 @@ def render_bill_tables(data: dict, heading: str | None = None):
         ("Total Due", _money(data.get("total_due"))),
     ]
     meta_df = pd.DataFrame(meta_rows, columns=["Field", "Value"])
-    st.dataframe(meta_df, hide_index=True, use_container_width=True)
+    st.dataframe(meta_df, hide_index=True, width='stretch')
 
     charges = data.get("charges") or []
     if not charges:
@@ -247,7 +247,7 @@ def render_bill_tables(data: dict, heading: str | None = None):
     st.dataframe(
         charges_df,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         column_config={
             "Quantity": st.column_config.NumberColumn(format="%.2f"),
             "Rate": st.column_config.NumberColumn(format="$%.4f"),
@@ -532,7 +532,7 @@ def render_consolidated_result(res: dict):
     st.dataframe(
         overview_df,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         column_config={"Total Due": st.column_config.NumberColumn(format="dollar")},
     )
 
