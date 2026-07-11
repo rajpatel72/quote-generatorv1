@@ -56,6 +56,7 @@ import copy
 import os
 
 import openpyxl
+from openpyxl.styles import PatternFill
 from openpyxl.worksheet.cell_range import CellRange
 
 
@@ -129,6 +130,7 @@ def fill_quote(
     tariff_debug: dict | None = None,
     tariff_override: str | None = None,
     proposed_charges: list[dict | None] | None = None,
+    proposed_retailer_color: str | None = None,
 ) -> str:
     """
     tariff_debug: optional dict passed in by the caller (e.g. {}). If given,
@@ -149,6 +151,13 @@ def fill_quote(
     "conditional_discount_pct", and "is_credit" - the same shape as a bill
     charge - used to fill J/K for that row instead of the bill's own current
     rate. See retailer_rates.build_proposed_charges().
+
+    proposed_retailer_color: optional ARGB hex string (e.g. "FFFF0000").
+    Colors the I30:I{total_row-1} divider column - the merged strip between
+    the Current Offer and New Proposed Offer tables - so the quote visually
+    flags which retailer the New Proposed Offer came from. See
+    retailer_rates.RETAILER_COLORS / retailer_color_hex(). Left uncolored
+    (template default) if not supplied.
     """
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb[SHEET_NAME]
@@ -254,6 +263,19 @@ def fill_quote(
     # period, whether or not any rows were inserted.
     billing_days = bill_data.get("billing_period_days") or 30
     ws[f"J{annual_savings_row}"] = f"=((H{total_row}-M{total_row})/{billing_days}*365)"
+
+    # Divider column (I30, merged I30:I{total_row-1} - the merge stretches
+    # automatically with any inserted rows since it starts above the
+    # insertion point) - color it to flag which retailer the New Proposed
+    # Offer came from. Untouched (template default, no fill) if no color
+    # was supplied.
+    if proposed_retailer_color:
+        ws["I30"].fill = PatternFill(
+            fill_type="solid",
+            fgColor=proposed_retailer_color,
+            start_color=proposed_retailer_color,
+            end_color=proposed_retailer_color,
+        )
 
     wb.save(output_path)
     return output_path
