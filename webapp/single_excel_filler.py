@@ -38,6 +38,15 @@ purpose so future-you doesn't reintroduce the same bugs):
    If the lookup fails for any reason we fall back to the extracted value
    so a flaky network call never blocks quote generation.
 
+5. `proposed_charges` (see retailer_rates.build_proposed_charges) fills the
+   "New Proposed Offer" columns (J/K, which the template's own L/M formulas
+   already turn into After Discount / Total). It's positional: entry i
+   corresponds to charges[i], same row as that charge's Current Offer line,
+   so the two offers stay lined up item-for-item. An entry of None (or a
+   proposed_charges list shorter than charges, or None altogether) just
+   leaves that row's J/K blank - same "don't guess" behaviour as an
+   unmatched charge line upstream in retailer_rates.classify_charges.
+
 The template reserves 3 charge-line rows (33, 34, 35) before the Total row
 (36). Bills with more than 3 charge lines get extra rows inserted between
 row 35 and row 36, with every affected row height / merge / summary formula
@@ -119,6 +128,7 @@ def fill_quote(
     output_path: str,
     tariff_debug: dict | None = None,
     tariff_override: str | None = None,
+    proposed_charges: list[dict | None] | None = None,
 ) -> str:
     """
     tariff_debug: optional dict passed in by the caller (e.g. {}). If given,
@@ -132,6 +142,13 @@ def fill_quote(
     directly and the cookie-based live lookup is skipped entirely - no
     network call is made and tariff_debug (if given) is populated with a
     synthetic "source": "override" entry instead.
+
+    proposed_charges: optional list, same length/order as
+    bill_data["charges"]. Each entry is either None (leave that row's New
+    Proposed Offer cells blank) or a dict with "rate_before_discount",
+    "conditional_discount_pct", and "is_credit" - the same shape as a bill
+    charge - used to fill J/K for that row instead of the bill's own current
+    rate. See retailer_rates.build_proposed_charges().
     """
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb[SHEET_NAME]
@@ -210,11 +227,21 @@ def fill_quote(
         ws[f"L{r}"] = f"=J{r}*(1-K{r})"
         ws[f"M{r}"] = f"=B{r}*L{r}"
 
+        # New Proposed Offer (J/K) for the same line item, if supplied.
+        # L/M for this row are already the formulas above, so as soon as
+        # J/K are populated the After Discount / Total cells compute
+        # themselves - nothing else needs to change on this row.
+        proposed = proposed_charges[i] if proposed_charges and i < len(proposed_charges) else None
+        if proposed:
+            p_rate = proposed.get("rate_before_discount")
+            ws[f"J{r}"] = -abs(p_rate) if (p_rate is not None and proposed.get("is_credit")) else p_rate
+            ws[f"K{r}"] = proposed.get("conditional_discount_pct")
+
     # Everything between the last real charge row and Total is blank —
     # this always includes at least the one mandatory buffer row, plus any
     # leftover reserved rows for bills with fewer than 3 charges.
     for r in range(last_charge_row + 1, total_row):
-        for col in ["B", "C", "E", "F", "G", "H", "L", "M"]:
+        for col in ["B", "C", "E", "F", "G", "H", "J", "K", "L", "M"]:
             ws[f"{col}{r}"] = None
 
     # --- fix up the formulas that depend on where the Total row now sits ---
