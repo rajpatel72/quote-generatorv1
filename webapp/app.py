@@ -186,6 +186,25 @@ st.markdown(
     }
     [data-testid="stMetricLabel"] { color: var(--ink-soft); font-size: 0.78rem; }
 
+    /* ---- Rate comparison: Current / New offer panels ---- */
+    .offer-header {
+        text-align: center; font-weight: 700; font-size: 0.92rem;
+        padding: 0.55rem 0.5rem; border-radius: 9px; margin-bottom: 0.5rem;
+    }
+    .offer-header.current { background: #F6C69A; color: #7A3D00; }
+    .offer-header.new { background: #B8E0A0; color: #1F5C0B; }
+    .offer-gst-note {
+        text-align: center; font-style: italic; font-size: 0.78rem;
+        color: var(--ink-soft); margin: -0.15rem 0 0.5rem 0;
+    }
+    .offer-total-bar {
+        display: flex; justify-content: space-between; align-items: center;
+        font-weight: 700; font-size: 0.92rem; padding: 0.55rem 0.9rem;
+        border-radius: 9px; margin-top: 0.5rem;
+    }
+    .offer-total-bar.current { background: #F6C69A; color: #7A3D00; }
+    .offer-total-bar.new { background: #B8E0A0; color: #1F5C0B; }
+
     /* ---- Misc ---- */
     div[data-testid="stStatusWidget"] { border-radius: 12px; }
     hr { border-color: var(--line) !important; }
@@ -364,119 +383,121 @@ def render_bill_tables(data: dict, heading: str | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Rate Comparison Table -- extensible "current vs. new offer" editor
+# Rate Comparison Table -- side-by-side "Current Energy Offer" vs.
+# "New Proposed Offer", modelled directly on the existing Excel layout:
+#   Before Discount | Conditional Discount | After Discount | Total  (x2)
 # ---------------------------------------------------------------------------
-def build_comparison_df(charges: list | None) -> pd.DataFrame:
-    """Seed the editable comparison table from a bill's extracted charges.
-    New Rate / New Disc % default to the bill's own values so the user only
-    has to touch the fields that actually change for the new offer."""
+def _init_comparison_master(charges: list | None) -> pd.DataFrame:
+    """One row per bill charge. Quantity + Description are kept as hidden
+    bookkeeping columns (not displayed) so 'Total' can still be computed and
+    'Auto-fill from tariff' can still match rows by description."""
     rows = []
     for c in charges or []:
         rows.append(
             {
-                "Include": True,
                 "Description": ("\u21A9 " if c.get("is_credit") else "") + (c.get("description") or ""),
-                "Quantity": c.get("quantity"),
-                "Unit": c.get("unit") or "",
-                "Current Rate": c.get("rate_before_discount"),
-                "Current Disc %": c.get("conditional_discount_pct"),
-                "New Rate": c.get("rate_before_discount"),
-                "New Disc %": c.get("conditional_discount_pct"),
-                "Source": "bill",
+                "Quantity": c.get("quantity") if c.get("quantity") is not None else 1,
+                "Current Before": c.get("rate_before_discount"),
+                "Current Cond %": c.get("conditional_discount_pct"),
+                "New Before": c.get("rate_before_discount"),
+                "New Cond %": c.get("conditional_discount_pct"),
             }
         )
     if not rows:
         rows.append(
             {
-                "Include": True, "Description": "", "Quantity": None, "Unit": "",
-                "Current Rate": None, "Current Disc %": None,
-                "New Rate": None, "New Disc %": None, "Source": "manual",
+                "Description": "", "Quantity": 1,
+                "Current Before": None, "Current Cond %": None,
+                "New Before": None, "New Cond %": None,
             }
         )
     return pd.DataFrame(rows)
 
 
-def comparison_df_to_records(df: pd.DataFrame | None) -> list[dict]:
+def _reconcile_master_length(master: pd.DataFrame, new_len: int) -> pd.DataFrame:
+    """Keeps the hidden master table in sync when the user adds/removes rows
+    in the New Proposed Offer editor (num_rows='dynamic'). Rows added beyond
+    the original bill charges have no 'Current' counterpart -- exactly right
+    for a brand-new charge that only exists in the new offer -- and default
+    to quantity 1 (a flat new rate) since there's no bill quantity for them."""
+    cur_len = len(master)
+    if new_len == cur_len:
+        return master
+    if new_len > cur_len:
+        extra = pd.DataFrame(
+            {
+                "Description": [""] * (new_len - cur_len),
+                "Quantity": [1] * (new_len - cur_len),
+                "Current Before": [None] * (new_len - cur_len),
+                "Current Cond %": [None] * (new_len - cur_len),
+                "New Before": [None] * (new_len - cur_len),
+                "New Cond %": [None] * (new_len - cur_len),
+            }
+        )
+        return pd.concat([master, extra], ignore_index=True)
+    return master.iloc[:new_len].reset_index(drop=True)
+
+
+def comparison_df_to_records(master: pd.DataFrame | None) -> list[dict]:
     """Template-ready row shape for the future New Offer section."""
-    if df is None or df.empty:
+    if master is None or master.empty:
         return []
-    return df.to_dict("records")
+    return master.to_dict("records")
 
 
-def _auto_fill_new_rates(df: pd.DataFrame, tariff_code: str | None) -> tuple[pd.DataFrame, bool]:
-    """Best-effort auto-fill of 'New Rate' from a (future) tariff_bridge rate
-    card. Looks for an optional `get_rate_card(tariff_code)` function on the
-    tariff_bridge module so this starts working the moment that lands there,
-    with no changes needed in app.py. Returns (df, whether anything filled)."""
+def _auto_fill_new_rates(master: pd.DataFrame, tariff_code: str | None) -> tuple[pd.DataFrame, bool]:
+    """Best-effort auto-fill of 'New Before' from a (future) tariff_bridge
+    rate card. Looks for an optional `get_rate_card(tariff_code)` function on
+    the tariff_bridge module so this starts working the moment that lands
+    there, with no changes needed in app.py. Returns (master, filled_any)."""
     lookup_fn = getattr(tariff_bridge_module, "get_rate_card", None)
     if not lookup_fn or not tariff_code:
-        return df, False
+        return master, False
     try:
         rate_card = lookup_fn(tariff_code) or {}
     except Exception:
-        return df, False
+        return master, False
     if not rate_card:
-        return df, False
+        return master, False
 
-    updated = df.copy()
+    updated = master.copy()
     filled_any = False
     for idx, row in updated.iterrows():
         match = rate_card.get(row.get("Description"))
         if match is not None:
-            updated.at[idx, "New Rate"] = match
-            updated.at[idx, "Source"] = "auto"
+            updated.at[idx, "New Before"] = match
             filled_any = True
     return updated, filled_any
 
 
-def _line_total(qty, rate, disc_pct):
-    if qty is None or rate is None:
+def _after_discount(before, cond_pct):
+    if before is None or (isinstance(before, float) and pd.isna(before)):
         return None
-    try:
-        disc = (disc_pct or 0) / 100.0
-        return float(qty) * float(rate) * (1 - disc)
-    except (TypeError, ValueError):
-        return None
-
-
-def compute_comparison_totals(df: pd.DataFrame) -> dict:
-    current_total, new_total = 0.0, 0.0
-    any_current = any_new = False
-    for _, row in df.iterrows():
-        if not row.get("Include", True):
-            continue
-        c = _line_total(row.get("Quantity"), row.get("Current Rate"), row.get("Current Disc %"))
-        n = _line_total(row.get("Quantity"), row.get("New Rate"), row.get("New Disc %"))
-        if c is not None:
-            current_total += c
-            any_current = True
-        if n is not None:
-            new_total += n
-            any_new = True
-    return {
-        "current_total": current_total if any_current else None,
-        "new_total": new_total if any_new else None,
-    }
+    cond = cond_pct if cond_pct is not None and not (isinstance(cond_pct, float) and pd.isna(cond_pct)) else 0
+    return before * (1 - cond / 100)
 
 
 def render_comparison_table(charges: list | None, state_key: str, tariff_code: str | None = None) -> pd.DataFrame:
-    """Renders the editable current-vs-new rate table for one site and
-    returns the live (edited) DataFrame. Persisted in st.session_state under
-    `state_key` so edits survive reruns (tariff lookups, tab switches, etc.)."""
+    """Renders the Current Energy Offer / New Proposed Offer side-by-side
+    tables for one site and returns the underlying master DataFrame
+    (Description, Quantity, Current Before/Cond %, New Before/Cond %).
+    Persisted in st.session_state under `state_key` so edits survive
+    reruns (tariff lookups, tab switches, etc.)."""
     st.markdown('<div class="section-label">Rate Comparison \u2014 New Offer</div>', unsafe_allow_html=True)
     st.caption(
-        "Edit rates for the new offer, or add/remove custom line items. This table is saved with the "
-        "quote and will feed the New Offer section of the template once that part is wired up."
+        "Current Energy Offer is read from the bill. Edit New Proposed Offer rates on the right, or add a "
+        "row for a brand-new charge that isn't on the current bill at all."
     )
 
     if state_key not in st.session_state:
-        st.session_state[state_key] = build_comparison_df(charges)
+        st.session_state[state_key] = _init_comparison_master(charges)
+    master = st.session_state[state_key]
 
-    _, auto_col = st.columns([3, 1.1])
+    _, auto_col = st.columns([3, 1.2])
     with auto_col:
-        if st.button("\u2728 Auto-fill from tariff", key=f"autofill_{state_key}", width="stretch"):
-            updated, filled = _auto_fill_new_rates(st.session_state[state_key], tariff_code)
-            st.session_state[state_key] = updated
+        if st.button("\u2728 Auto-fill from tariff", key=f"autofill_{state_key}"):
+            master, filled = _auto_fill_new_rates(master, tariff_code)
+            st.session_state[state_key] = master
             if filled:
                 st.toast("Auto-filled new rates from the tariff rate card.")
             else:
@@ -486,38 +507,92 @@ def render_comparison_table(charges: list | None, state_key: str, tariff_code: s
                     unsafe_allow_html=True,
                 )
 
-    edited = st.data_editor(
-        st.session_state[state_key],
-        key=f"{state_key}_editor",
-        num_rows="dynamic",
-        hide_index=True,
-        width='stretch',
-        column_config={
-            "Include": st.column_config.CheckboxColumn(width="small", help="Include this line in the new offer"),
-            "Quantity": st.column_config.NumberColumn(format="%.2f"),
-            "Current Rate": st.column_config.NumberColumn(format="$%.4f", disabled=True),
-            "Current Disc %": st.column_config.NumberColumn(format="%.1f%%", disabled=True),
-            "New Rate": st.column_config.NumberColumn(format="$%.4f"),
-            "New Disc %": st.column_config.NumberColumn(format="%.1f%%"),
-            "Source": st.column_config.TextColumn(disabled=True, width="small"),
-        },
-    )
-    st.session_state[state_key] = edited
+    left, right = st.columns(2, gap="small")
 
-    totals = compute_comparison_totals(edited)
-    cur, new = totals["current_total"], totals["new_total"]
-    if cur is not None or new is not None:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Current (bill)", _money(cur) if cur is not None else "\u2014")
-        m2.metric("New offer", _money(new) if new is not None else "\u2014")
-        if cur and new is not None:
-            delta = new - cur
-            pct = (delta / cur * 100) if cur else 0.0
-            m3.metric("Change", _money(delta), f"{pct:+.1f}%", delta_color="inverse")
-        else:
-            m3.metric("Change", "\u2014")
+    # ---- Current Energy Offer (read-only, from the bill) ----
+    with left:
+        with st.container(border=True):
+            st.markdown('<div class="offer-header current">Current Energy Offer</div>', unsafe_allow_html=True)
+            st.markdown('<div class="offer-gst-note">Rates are Inclusive of GST</div>', unsafe_allow_html=True)
+            current_view = pd.DataFrame(
+                {
+                    "Before Discount": master["Current Before"],
+                    "Conditional Discount": master["Current Cond %"],
+                }
+            )
+            current_view["After Discount"] = [
+                _after_discount(b, c) for b, c in zip(current_view["Before Discount"], current_view["Conditional Discount"])
+            ]
+            current_view["Total"] = [
+                (a * q if a is not None and pd.notna(q) else None)
+                for a, q in zip(current_view["After Discount"], master["Quantity"])
+            ]
+            st.dataframe(
+                current_view,
+                hide_index=True,
+                width='stretch',
+                column_config={
+                    "Before Discount": st.column_config.NumberColumn(format="$%.4f"),
+                    "Conditional Discount": st.column_config.NumberColumn(format="%.1f%%"),
+                    "After Discount": st.column_config.NumberColumn(format="$%.4f"),
+                    "Total": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+            current_total = current_view["Total"].dropna().sum() if current_view["Total"].notna().any() else 0.0
+            st.markdown(
+                f'<div class="offer-total-bar current"><span>Total (GST Incl.)</span><span>{_money(current_total)}</span></div>',
+                unsafe_allow_html=True,
+            )
 
-    return edited
+    # ---- New Proposed Offer (editable) ----
+    with right:
+        with st.container(border=True):
+            st.markdown('<div class="offer-header new">New Proposed Offer</div>', unsafe_allow_html=True)
+            st.markdown('<div class="offer-gst-note">Rates are Inclusive of GST</div>', unsafe_allow_html=True)
+            new_view = pd.DataFrame(
+                {
+                    "Before Discount": master["New Before"],
+                    "Conditional Discount": master["New Cond %"],
+                }
+            )
+            new_view["After Discount"] = [
+                _after_discount(b, c) for b, c in zip(new_view["Before Discount"], new_view["Conditional Discount"])
+            ]
+            new_view["Total"] = [
+                (a * q if a is not None and pd.notna(q) else None)
+                for a, q in zip(new_view["After Discount"], master["Quantity"])
+            ]
+            edited_new = st.data_editor(
+                new_view,
+                key=f"{state_key}_new_editor",
+                num_rows="dynamic",
+                hide_index=True,
+                width='stretch',
+                column_config={
+                    "Before Discount": st.column_config.NumberColumn(format="$%.4f"),
+                    "Conditional Discount": st.column_config.NumberColumn(format="%.1f%%"),
+                    "After Discount": st.column_config.NumberColumn(format="$%.4f", disabled=True),
+                    "Total": st.column_config.NumberColumn(format="$%.2f", disabled=True),
+                },
+            )
+            master = _reconcile_master_length(master, len(edited_new))
+            master["New Before"] = edited_new["Before Discount"].values
+            master["New Cond %"] = edited_new["Conditional Discount"].values
+            st.session_state[state_key] = master
+
+            new_total = edited_new["Total"].dropna().sum() if edited_new["Total"].notna().any() else 0.0
+            st.markdown(
+                f'<div class="offer-total-bar new"><span>Total (GST Incl.)</span><span>{_money(new_total)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    if current_total or new_total:
+        delta = new_total - current_total
+        pct = (delta / current_total * 100) if current_total else 0.0
+        sign = "\U0001F53B" if delta > 0 else ("\U0001F53C" if delta < 0 else "\u2796")
+        st.caption(f"{sign} Estimated change: **{_money(delta)}** ({pct:+.1f}%) vs. the current bill.")
+
+    return master
 
 
 def _clear_comparison_state(prefix: str):
