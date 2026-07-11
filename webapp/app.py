@@ -19,6 +19,33 @@ UI notes:
   The month/year used is the date the quote was generated (bills don't carry
   a reliable "issue date" field in the schema) -- flag if you'd rather this
   used something else, e.g. a billing period end date.
+
+Rate Comparison Table (new)
+----------------------------
+Each site (single or consolidated) now gets an editable "Rate Comparison —
+New Offer" table, seeded from the extracted bill charges. Users can:
+  - edit the "New Rate" / "New Disc %" columns per line
+  - add or remove custom line items (num_rows="dynamic")
+  - click "Auto-fill from tariff" to pull suggested rates automatically
+
+FUTURE INTEGRATION NOTE (read this before wiring the New Offer template):
+This table is UI + data-model only today. Edited rows are captured into the
+generated result dict under `rate_comparison` (single) / `rate_comparisons`
+(consolidated, keyed by site index) but are NOT YET passed into
+fill_quote() / fill_consolidated_quote(). To finish the loop later:
+  1. Add a `new_offer_rates` (or similar) parameter to fill_quote() and
+     fill_consolidated_quote() in single_excel_filler.py /
+     consolidated_excel_filler.py that writes these rows into the
+     template's "New Offer" section.
+  2. Pass `res["rate_comparison"]` / `res["rate_comparisons"]` straight
+     through when calling those functions -- the row shape
+     (description / quantity / unit / current_rate / new_rate / ...)
+     is already template-ready, see `comparison_df_to_records()`.
+  3. For automatic (non-manual) rate suggestions, add a function such as
+     `get_rate_card(tariff_code) -> dict[str, float]` to tariff_bridge.py.
+     `_auto_fill_new_rates()` below calls this via getattr() already, so
+     it will start working the moment tariff_bridge exposes it -- no
+     app.py changes required.
 """
 import os
 import re
@@ -29,6 +56,7 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfWriter
 
+import tariff_bridge as tariff_bridge_module
 from single_gemini_client import extract_bill
 from single_excel_filler import fill_quote
 from consolidated_gemini_client import extract_consolidated_bills
@@ -36,52 +64,131 @@ from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
 from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff, render_bulk_lookup_button
 
-st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="centered")
+st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Look & feel
+# Look & feel -- premium, quiet, brand-consistent
 # ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
- 
-    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
-    .block-container { padding-top: 3.2rem; max-width: 820px; }
- 
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+    :root {
+        --ink: #10192E;
+        --ink-soft: #4A5573;
+        --line: rgba(16, 25, 46, 0.08);
+        --navy: #16294D;
+        --navy-2: #23407A;
+        --accent: #C4123A;
+        --accent-soft: rgba(196, 18, 58, 0.08);
+        --good: #1C7A43;
+        --good-soft: rgba(46, 204, 113, 0.10);
+        --warn: #8A6100;
+        --warn-soft: rgba(255, 193, 7, 0.12);
+        --card: #FFFFFF;
+        --canvas: #F4F6FB;
+    }
+
+    html, body, [class*="css"] { font-family: 'Inter', 'Space Grotesk', sans-serif; color: var(--ink); }
+
+    .stApp { background: var(--canvas); }
+    .block-container { padding-top: 2.4rem; padding-bottom: 3rem; max-width: 1080px; margin: 0 auto; }
+
+    /* ---- Header ---- */
+    .app-header { display: flex; align-items: center; gap: 0.9rem; margin-bottom: 0.2rem; }
+    .app-header img { border-radius: 8px; }
     .hero-badge {
-        display: inline-block; padding: 0.2rem 0.75rem; border-radius: 999px;
-        background: rgba(236, 27, 64, 0.08); border: 1px solid rgba(236, 27, 64, 0.35);
-        color: #C4123A; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
-        text-transform: uppercase; margin-bottom: 0.7rem;
+        display: inline-block; padding: 0.22rem 0.8rem; border-radius: 999px;
+        background: var(--accent-soft); border: 1px solid rgba(196, 18, 58, 0.28);
+        color: var(--accent); font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em;
+        text-transform: uppercase; margin-bottom: 0.65rem;
     }
     .hero-title {
-        font-size: 2.3rem; font-weight: 700; line-height: 1.15; margin-bottom: 0.15rem;
-        background: linear-gradient(90deg, #1D3A66, #25477C 45%, #EC1B40);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 2.05rem; font-weight: 700; line-height: 1.15; margin: 0;
+        color: var(--navy);
+        letter-spacing: -0.01em;
     }
-    .hero-sub { color: #55607A; font-size: 1rem; margin-bottom: 1.6rem; }
- 
+    .hero-sub { color: var(--ink-soft); font-size: 0.95rem; margin: 0.5rem 0 1.6rem 0; line-height: 1.55; }
+    .hero-sub ul { margin: 0; padding-left: 1.1rem; }
+    .hero-sub li { margin-bottom: 0.15rem; }
+
+    /* ---- Section labels ---- */
+    .section-label {
+        display: flex; align-items: center; gap: 0.5rem;
+        font-size: 0.72rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
+        color: var(--navy-2); margin: 1.3rem 0 0.55rem 0;
+    }
+    .section-label::before {
+        content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+        background: var(--accent);
+    }
+    .meta-caption { color: #7A84A0; font-size: 0.8rem; }
+
+    /* ---- Status banners ---- */
     .field-flag {
-        background: rgba(255, 193, 7, 0.12); border: 1px solid rgba(255, 193, 7, 0.45);
-        color: #8A6100; border-radius: 8px; padding: 0.5rem 0.9rem; margin-bottom: 0.4rem;
-        font-size: 0.9rem;
+        background: var(--warn-soft); border: 1px solid rgba(255, 193, 7, 0.4);
+        color: var(--warn); border-radius: 10px; padding: 0.55rem 0.9rem; margin-bottom: 0.4rem;
+        font-size: 0.88rem;
     }
     .ok-banner {
-        background: rgba(46, 204, 113, 0.12); border: 1px solid rgba(46, 204, 113, 0.45);
-        color: #1C7A43; border-radius: 8px; padding: 0.65rem 1rem; font-size: 0.92rem;
+        background: var(--good-soft); border: 1px solid rgba(46, 204, 113, 0.35);
+        color: var(--good); border-radius: 10px; padding: 0.65rem 1rem; font-size: 0.9rem;
         margin-bottom: 0.7rem;
     }
-    .section-label {
-        font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-        color: #3A5686; margin: 1.1rem 0 0.4rem 0;
+    .info-banner {
+        background: rgba(35, 64, 122, 0.06); border: 1px solid rgba(35, 64, 122, 0.18);
+        color: var(--navy-2); border-radius: 10px; padding: 0.6rem 0.9rem; font-size: 0.88rem;
+        margin-bottom: 0.6rem;
     }
-    .meta-caption { color: #6B7690; font-size: 0.82rem; }
- 
+
+    /* ---- Cards (bordered containers) ---- */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        background: var(--card);
+        border: 1px solid var(--line) !important;
+        border-radius: 16px !important;
+        box-shadow: 0 1px 2px rgba(16, 25, 46, 0.03), 0 8px 24px rgba(16, 25, 46, 0.035);
+        padding: 0.25rem 0.25rem;
+    }
+
+    /* ---- Tabs as a quiet segmented control ---- */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.3rem; background: rgba(16, 25, 46, 0.04); padding: 0.3rem;
+        border-radius: 12px; border: 1px solid var(--line);
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 2.5rem; border-radius: 9px; font-weight: 600; font-size: 0.9rem;
+        color: var(--ink-soft); background: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        background: var(--card) !important; color: var(--navy) !important;
+        box-shadow: 0 1px 3px rgba(16, 25, 46, 0.08);
+    }
+
+    /* ---- Buttons ---- */
     .stButton > button, .stDownloadButton > button {
         border-radius: 10px; font-weight: 600; letter-spacing: 0.01em;
+        border: 1px solid var(--line);
     }
+    .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+        background: linear-gradient(135deg, var(--navy), var(--navy-2));
+        border: none;
+    }
+    .stButton > button[kind="primary"]:hover, .stDownloadButton > button[kind="primary"]:hover {
+        filter: brightness(1.08);
+    }
+
+    /* ---- Metrics ---- */
+    [data-testid="stMetric"] {
+        background: rgba(16, 25, 46, 0.025); border: 1px solid var(--line);
+        border-radius: 12px; padding: 0.7rem 0.9rem 0.5rem 0.9rem;
+    }
+    [data-testid="stMetricLabel"] { color: var(--ink-soft); font-size: 0.78rem; }
+
+    /* ---- Misc ---- */
     div[data-testid="stStatusWidget"] { border-radius: 12px; }
+    hr { border-color: var(--line) !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -257,6 +364,169 @@ def render_bill_tables(data: dict, heading: str | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Rate Comparison Table -- extensible "current vs. new offer" editor
+# ---------------------------------------------------------------------------
+def build_comparison_df(charges: list | None) -> pd.DataFrame:
+    """Seed the editable comparison table from a bill's extracted charges.
+    New Rate / New Disc % default to the bill's own values so the user only
+    has to touch the fields that actually change for the new offer."""
+    rows = []
+    for c in charges or []:
+        rows.append(
+            {
+                "Include": True,
+                "Description": ("\u21A9 " if c.get("is_credit") else "") + (c.get("description") or ""),
+                "Quantity": c.get("quantity"),
+                "Unit": c.get("unit") or "",
+                "Current Rate": c.get("rate_before_discount"),
+                "Current Disc %": c.get("conditional_discount_pct"),
+                "New Rate": c.get("rate_before_discount"),
+                "New Disc %": c.get("conditional_discount_pct"),
+                "Source": "bill",
+            }
+        )
+    if not rows:
+        rows.append(
+            {
+                "Include": True, "Description": "", "Quantity": None, "Unit": "",
+                "Current Rate": None, "Current Disc %": None,
+                "New Rate": None, "New Disc %": None, "Source": "manual",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def comparison_df_to_records(df: pd.DataFrame | None) -> list[dict]:
+    """Template-ready row shape for the future New Offer section."""
+    if df is None or df.empty:
+        return []
+    return df.to_dict("records")
+
+
+def _auto_fill_new_rates(df: pd.DataFrame, tariff_code: str | None) -> tuple[pd.DataFrame, bool]:
+    """Best-effort auto-fill of 'New Rate' from a (future) tariff_bridge rate
+    card. Looks for an optional `get_rate_card(tariff_code)` function on the
+    tariff_bridge module so this starts working the moment that lands there,
+    with no changes needed in app.py. Returns (df, whether anything filled)."""
+    lookup_fn = getattr(tariff_bridge_module, "get_rate_card", None)
+    if not lookup_fn or not tariff_code:
+        return df, False
+    try:
+        rate_card = lookup_fn(tariff_code) or {}
+    except Exception:
+        return df, False
+    if not rate_card:
+        return df, False
+
+    updated = df.copy()
+    filled_any = False
+    for idx, row in updated.iterrows():
+        match = rate_card.get(row.get("Description"))
+        if match is not None:
+            updated.at[idx, "New Rate"] = match
+            updated.at[idx, "Source"] = "auto"
+            filled_any = True
+    return updated, filled_any
+
+
+def _line_total(qty, rate, disc_pct):
+    if qty is None or rate is None:
+        return None
+    try:
+        disc = (disc_pct or 0) / 100.0
+        return float(qty) * float(rate) * (1 - disc)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_comparison_totals(df: pd.DataFrame) -> dict:
+    current_total, new_total = 0.0, 0.0
+    any_current = any_new = False
+    for _, row in df.iterrows():
+        if not row.get("Include", True):
+            continue
+        c = _line_total(row.get("Quantity"), row.get("Current Rate"), row.get("Current Disc %"))
+        n = _line_total(row.get("Quantity"), row.get("New Rate"), row.get("New Disc %"))
+        if c is not None:
+            current_total += c
+            any_current = True
+        if n is not None:
+            new_total += n
+            any_new = True
+    return {
+        "current_total": current_total if any_current else None,
+        "new_total": new_total if any_new else None,
+    }
+
+
+def render_comparison_table(charges: list | None, state_key: str, tariff_code: str | None = None) -> pd.DataFrame:
+    """Renders the editable current-vs-new rate table for one site and
+    returns the live (edited) DataFrame. Persisted in st.session_state under
+    `state_key` so edits survive reruns (tariff lookups, tab switches, etc.)."""
+    st.markdown('<div class="section-label">Rate Comparison \u2014 New Offer</div>', unsafe_allow_html=True)
+    st.caption(
+        "Edit rates for the new offer, or add/remove custom line items. This table is saved with the "
+        "quote and will feed the New Offer section of the template once that part is wired up."
+    )
+
+    if state_key not in st.session_state:
+        st.session_state[state_key] = build_comparison_df(charges)
+
+    _, auto_col = st.columns([3, 1.1])
+    with auto_col:
+        if st.button("\u2728 Auto-fill from tariff", key=f"autofill_{state_key}", width="stretch"):
+            updated, filled = _auto_fill_new_rates(st.session_state[state_key], tariff_code)
+            st.session_state[state_key] = updated
+            if filled:
+                st.toast("Auto-filled new rates from the tariff rate card.")
+            else:
+                st.markdown(
+                    '<div class="info-banner">\u2139\uFE0F Automatic rate lookup isn\'t available for this '
+                    "tariff yet \u2014 enter the new rates manually below.</div>",
+                    unsafe_allow_html=True,
+                )
+
+    edited = st.data_editor(
+        st.session_state[state_key],
+        key=f"{state_key}_editor",
+        num_rows="dynamic",
+        hide_index=True,
+        width='stretch',
+        column_config={
+            "Include": st.column_config.CheckboxColumn(width="small", help="Include this line in the new offer"),
+            "Quantity": st.column_config.NumberColumn(format="%.2f"),
+            "Current Rate": st.column_config.NumberColumn(format="$%.4f", disabled=True),
+            "Current Disc %": st.column_config.NumberColumn(format="%.1f%%", disabled=True),
+            "New Rate": st.column_config.NumberColumn(format="$%.4f"),
+            "New Disc %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Source": st.column_config.TextColumn(disabled=True, width="small"),
+        },
+    )
+    st.session_state[state_key] = edited
+
+    totals = compute_comparison_totals(edited)
+    cur, new = totals["current_total"], totals["new_total"]
+    if cur is not None or new is not None:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Current (bill)", _money(cur) if cur is not None else "\u2014")
+        m2.metric("New offer", _money(new) if new is not None else "\u2014")
+        if cur and new is not None:
+            delta = new - cur
+            pct = (delta / cur * 100) if cur else 0.0
+            m3.metric("Change", _money(delta), f"{pct:+.1f}%", delta_color="inverse")
+        else:
+            m3.metric("Change", "\u2014")
+
+    return edited
+
+
+def _clear_comparison_state(prefix: str):
+    for k in list(st.session_state.keys()):
+        if k.startswith(prefix):
+            del st.session_state[k]
+
+
+# ---------------------------------------------------------------------------
 # Single-site pipeline
 # ---------------------------------------------------------------------------
 def _clean_nmi(data: dict) -> str | None:
@@ -304,10 +574,15 @@ def extract_single(pdf_bytes: bytes, filename: str):
             return None
 
 
-def generate_single_excel(extracted: dict, tariff_override: str | None):
+def generate_single_excel(extracted: dict, tariff_override: str | None, comparison_df: pd.DataFrame | None = None):
     """Phase 2: build the Excel quote from already-extracted data, using the
     live-looked-up NTC (if any) instead of whatever tariff Gemini read off
-    the bill text."""
+    the bill text.
+
+    `comparison_df` (the edited rate-comparison table) is captured onto the
+    result as `rate_comparison` so it travels with the quote. It is not yet
+    passed into fill_quote() -- see the module docstring for the wiring
+    plan once the template's New Offer section is ready."""
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "generated_quote.xlsx")
         tariff_debug: dict = {}
@@ -336,6 +611,7 @@ def generate_single_excel(extracted: dict, tariff_override: str | None):
             "review_fields": extracted["review_fields"],
             "degraded_mode": extracted["degraded_mode"],
             "tariff_debug": tariff_debug,
+            "rate_comparison": comparison_df_to_records(comparison_df),
             "generated_at": datetime.now().strftime("%H:%M:%S"),
         }
 
@@ -349,6 +625,7 @@ def reset_single():
     elif result:
         nmi = _clean_nmi(result["data"])
     clear_cached_tariff(nmi)
+    _clear_comparison_state("single_comparison_df")
     st.session_state.update(single_extracted=None, single_result=None)
 
 
@@ -376,6 +653,13 @@ def render_single_result(res: dict):
         st.caption(f"\u26A1 Tariff on this quote (B16): **{tariff_debug.get('tariff')}** \u2014 live lookup from the portal.")
     else:
         st.caption("\u2139\uFE0F Tariff on this quote (B16) came from the bill text \u2014 no live lookup was used, so double-check it.")
+
+    if res.get("rate_comparison"):
+        st.markdown('<div class="section-label">Rate Comparison Saved</div>', unsafe_allow_html=True)
+        st.caption(
+            f"{len(res['rate_comparison'])} line item(s) saved with this quote for the New Offer section "
+            "(not yet written into the Excel file \u2014 coming soon)."
+        )
 
     st.markdown('<div class="section-label">Download</div>', unsafe_allow_html=True)
     st.download_button(
@@ -406,10 +690,10 @@ def extract_consolidated(pdf_bytes_list, filenames):
                 f.write(data)
             pdf_paths.append(p)
 
-        status = st.status("Processing bill(s)…", expanded=True)
+        status = st.status("Processing bill(s)\u2026", expanded=True)
         try:
             if len(pdf_paths) > 1:
-                status.write(f"📎 Merging {len(pdf_paths)} PDFs into one file…")
+                status.write(f"\U0001F4CE Merging {len(pdf_paths)} PDFs into one file\u2026")
                 merged_path = os.path.join(tmp, "merged.pdf")
                 writer = PdfWriter()
                 for p in pdf_paths:
@@ -418,7 +702,7 @@ def extract_consolidated(pdf_bytes_list, filenames):
             else:
                 merged_path = pdf_paths[0]
 
-            status.write("📤 Sending to analyzer for multi-site extraction (can take a few minutes)…")
+            status.write("\U0001F4E4 Sending to analyzer for multi-site extraction (can take a few minutes)\u2026")
             result = extract_consolidated_bills(merged_path, api_keys=API_KEYS)
 
             if not result["success"]:
@@ -433,7 +717,7 @@ def extract_consolidated(pdf_bytes_list, filenames):
                 st.error("No sites were found in the uploaded PDF(s). Double-check the file(s) and try again.")
                 return None
 
-            status.update(label=f"✅ Extracted {len(bills)} site(s)", state="complete", expanded=False)
+            status.update(label=f"\u2705 Extracted {len(bills)} site(s)", state="complete", expanded=False)
             return {
                 "bills": bills,
                 "review_notes": result.get("review_notes", []),
@@ -447,12 +731,17 @@ def extract_consolidated(pdf_bytes_list, filenames):
             return None
 
 
-def generate_consolidated_excel(extracted_data, client_name):
-    """Phase 2: Build the Excel quote using cached NTC lookups."""
+def generate_consolidated_excel(extracted_data, client_name, comparison_dfs: dict | None = None):
+    """Phase 2: Build the Excel quote using cached NTC lookups.
+
+    `comparison_dfs` (per-site edited rate tables, keyed by site index) are
+    captured onto the result as `rate_comparisons` -- see the module
+    docstring for the plan to wire these into fill_consolidated_quote()."""
     bills = extracted_data["bills"]
+    comparison_dfs = comparison_dfs or {}
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "consolidated_quote.xlsx")
-        
+
         # Gather any live tariffs fetched by the user
         tariff_overrides = {}
         for b in bills:
@@ -464,9 +753,9 @@ def generate_consolidated_excel(extracted_data, client_name):
 
         try:
             fill_consolidated_quote(
-                bills, 
-                out_path, 
-                client_name=client_name or None, 
+                bills,
+                out_path,
+                client_name=client_name or None,
                 tariff_overrides=tariff_overrides
             )
             with open(out_path, "rb") as f:
@@ -477,12 +766,17 @@ def generate_consolidated_excel(extracted_data, client_name):
                 st.exception(e)
             return None
 
+        rate_comparisons = {
+            str(i): comparison_df_to_records(df) for i, df in comparison_dfs.items()
+        }
+
         return {
             "success": True,
             "excel_bytes": excel_bytes,
             "filename": build_consolidated_filename(client_name, bills),
             "bills": bills,
             "review_notes": extracted_data.get("review_notes", []),
+            "rate_comparisons": rate_comparisons,
             "generated_at": datetime.now().strftime("%H:%M:%S"),
             "n_sites": len(bills),
         }
@@ -491,7 +785,7 @@ def generate_consolidated_excel(extracted_data, client_name):
 def reset_consolidated():
     extracted = st.session_state.get("consolidated_extracted")
     result = st.session_state.get("consolidated_result")
-    
+
     # Clear out cached tariffs for all NMIs involved in this batch
     if extracted:
         for b in extracted["bills"]:
@@ -499,10 +793,11 @@ def reset_consolidated():
     elif result:
         for b in result["bills"]:
             clear_cached_tariff(_clean_nmi(b))
-            
+
+    _clear_comparison_state("cons_comparison_df")
     st.session_state.update(
-        consolidated_extracted=None, 
-        consolidated_result=None, 
+        consolidated_extracted=None,
+        consolidated_result=None,
         consolidated_client_name=""
     )
 
@@ -537,10 +832,15 @@ def render_consolidated_result(res: dict):
     )
 
     st.markdown('<div class="section-label">Per-Site Detail</div>', unsafe_allow_html=True)
+    rate_comparisons = res.get("rate_comparisons") or {}
     for i, bill in enumerate(res["bills"], start=1):
         label = bill.get("site_address") or bill.get("customer_name") or f"Site {i}"
         with st.expander(f"{i}. {label}"):
             render_bill_tables(bill)
+            saved_rows = rate_comparisons.get(str(i))
+            if saved_rows:
+                st.markdown('<div class="section-label">Rate Comparison Saved</div>', unsafe_allow_html=True)
+                st.caption(f"{len(saved_rows)} line item(s) saved for the New Offer section (not yet written into the Excel file).")
 
     st.markdown('<div class="section-label">Download</div>', unsafe_allow_html=True)
     st.download_button(
@@ -562,11 +862,20 @@ def render_consolidated_result(res: dict):
 # UI
 # ---------------------------------------------------------------------------
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
-if os.path.exists(_LOGO_PATH):
-    st.image(_LOGO_PATH, width=260)
-st.markdown('<div class="hero-badge">\u26A1 Quoting Tool</div>', unsafe_allow_html=True)
+header_l, header_r = st.columns([1, 6])
+with header_l:
+    if os.path.exists(_LOGO_PATH):
+        st.image(_LOGO_PATH, width=64)
+with header_r:
+    st.markdown('<div class="hero-badge">\u26A1 Quoting Tool</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-title">Bills \u2192 Quote</div>', unsafe_allow_html=True)
+
 st.markdown(
-    '<div class="hero-sub"><li>Upload an electricity/gas bill PDF and get a quote back to fill New Offer.</li><li> For Consolidated Quote swith to "Consolidated / Multi-Site".</li><li>Must check it thoroughly to insure no error.</li></div>',
+    '<div class="hero-sub"><ul>'
+    "<li>Upload an electricity/gas bill PDF and get a quote back to fill New Offer.</li>"
+    '<li>For a consolidated quote, switch to \u201cConsolidated / Multi-site\u201d.</li>'
+    "<li>Always double-check the extracted figures and new rates before sending a quote out.</li>"
+    "</ul></div>",
     unsafe_allow_html=True,
 )
 
@@ -627,12 +936,18 @@ with tab_single:
                     )
                     render_auto_lookup(nmi, key="single")
 
+            comparison_df = render_comparison_table(
+                extracted["data"].get("charges"),
+                state_key="single_comparison_df",
+                tariff_code=get_cached_tariff(nmi) or extracted["data"].get("tariff_classification"),
+            )
+
             st.markdown('<div class="section-label">Generate Quote</div>', unsafe_allow_html=True)
             gcol1, gcol2 = st.columns([1, 1])
             with gcol1:
                 if st.button("\U0001F4CA Generate Excel Quote", type="primary", key="run_generate_single"):
                     tariff_override = get_cached_tariff(nmi)
-                    res = generate_single_excel(extracted, tariff_override)
+                    res = generate_single_excel(extracted, tariff_override, comparison_df)
                     if res:
                         st.session_state.single_result = res
                         st.rerun()
@@ -665,36 +980,36 @@ with tab_consolidated:
             nmi_val = _clean_nmi(b)
             if nmi_val:
                 all_nmis.append(nmi_val)
-        
+
         # Deduplicate and find missing ones
         unique_nmis = list(dict.fromkeys(all_nmis))
         missing_nmis = [n for n in unique_nmis if not get_cached_tariff(n)]
 
         with st.container(border=True):
-            st.markdown(f'<div class="ok-banner">\u2705 Found {extracted["n_sites"]} site(s). Review data and fetch live tariffs below before generating the quote.</div>', unsafe_allow_html=True)
-            
-            # --- THE NEW BULK BUTTON SECTION ---
-            st.markdown('<div class="section-label" style="margin-top: 1rem;">Network Tariff Lookup (Bulk)</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ok-banner">\u2705 Found {extracted["n_sites"]} site(s). Review data, fetch live tariffs, and set new offer rates below before generating the quote.</div>', unsafe_allow_html=True)
+
+            # --- Bulk tariff lookup ---
+            st.markdown('<div class="section-label">Network Tariff Lookup (Bulk)</div>', unsafe_allow_html=True)
             if missing_nmis:
                 st.caption(f"There are **{len(missing_nmis)}** site(s) missing live tariffs. Click below to fetch them all at once.")
                 render_bulk_lookup_button(missing_nmis, key="run_bulk_lookup")
             elif unique_nmis:
-                st.markdown('<div class="ok-banner" style="margin-top: 0.5rem;">✅ All live tariffs successfully fetched for this portfolio!</div>', unsafe_allow_html=True)
+                st.markdown('<div class="ok-banner">\u2705 All live tariffs successfully fetched for this portfolio!</div>', unsafe_allow_html=True)
             else:
                 st.caption("No NMIs were found in this portfolio to look up.")
-            # -----------------------------------
-            
-            st.markdown('<div class="section-label" style="margin-top: 1rem;">Sites Overview & Tariffs</div>', unsafe_allow_html=True)
-            
+
+            st.markdown('<div class="section-label">Sites, Tariffs \u0026 Rate Comparison</div>', unsafe_allow_html=True)
+
+            comparison_dfs = {}
             for i, bill in enumerate(extracted["bills"], start=1):
                 label = bill.get("site_address") or bill.get("customer_name") or f"Site {i}"
                 nmi = _clean_nmi(bill)
-                
+
                 with st.expander(f"{i}. {label} (NMI: {nmi or 'None'})", expanded=False):
                     render_bill_tables(bill)
-                    
+
                     if not nmi:
-                        st.caption("No NMI extracted — automated lookup suspended for this site.")
+                        st.caption("No NMI extracted \u2014 automated lookup suspended for this site.")
                     else:
                         cached = get_cached_tariff(nmi)
                         if cached:
@@ -707,12 +1022,18 @@ with tab_consolidated:
                         else:
                             st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '\u2014'}**. Awaiting bulk lookup above.")
 
-            st.markdown('<div class="section-label" style="margin-top: 2rem;">Generate Quote</div>', unsafe_allow_html=True)
+                    comparison_dfs[i] = render_comparison_table(
+                        bill.get("charges"),
+                        state_key=f"cons_comparison_df_{i}",
+                        tariff_code=get_cached_tariff(nmi) if nmi else bill.get("tariff_classification"),
+                    )
+
+            st.markdown('<div class="section-label">Generate Quote</div>', unsafe_allow_html=True)
             gcol1, gcol2 = st.columns([1, 1])
             with gcol1:
                 if st.button("\U0001F4CA Generate Consolidated Quote", type="primary", key="run_gen_consolidated"):
-                    with st.spinner("Building the Excel quote..."):
-                        res = generate_consolidated_excel(extracted, client_name)
+                    with st.spinner("Building the Excel quote\u2026"):
+                        res = generate_consolidated_excel(extracted, client_name, comparison_dfs)
                         if res:
                             st.session_state.consolidated_result = res
                             st.rerun()
@@ -734,7 +1055,7 @@ with tab_consolidated:
             run = st.button(
                 "Extract Bill Data", type="primary", disabled=not uploaded_files, key="run_consolidated"
             )
-        
+
         if run and uploaded_files:
             data_list = [f.getvalue() for f in uploaded_files]
             names = [f.name for f in uploaded_files]
