@@ -194,6 +194,7 @@ st.markdown(
 
     .st-emotion-cache-ds661v, .st-emotion-cache-rzg2vg {   
     border: solid 1px grey;
+    border-radius: 5px;
     }
 
     /* ---- Metrics ---- */
