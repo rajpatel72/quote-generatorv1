@@ -34,7 +34,7 @@ from single_excel_filler import fill_quote
 from consolidated_gemini_client import extract_consolidated_bills
 from consolidated_excel_filler import fill_consolidated_quote
 from api_key_pool import load_api_keys
-from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff
+from tariff_bridge import render_auto_lookup, get_cached_tariff, get_cached_tariff_debug, clear_cached_tariff, render_bulk_lookup_button
 
 st.set_page_config(page_title="Bills \u2192 Quote", page_icon="\u26A1", layout="centered")
 
@@ -655,14 +655,36 @@ with tab_consolidated:
             render_consolidated_result(st.session_state.consolidated_result)
         st.button("\U0001F504 Process another batch", key="reset_consolidated", on_click=reset_consolidated)
 
-    elif st.session_state.consolidated_extracted is not None:
+elif st.session_state.consolidated_extracted is not None:
         extracted = st.session_state.consolidated_extracted
         client_name = st.session_state.consolidated_client_name
+
+        # Calculate exactly which NMIs still need lookup
+        all_nmis = []
+        for b in extracted["bills"]:
+            nmi_val = _clean_nmi(b)
+            if nmi_val:
+                all_nmis.append(nmi_val)
+        
+        # Deduplicate and find missing ones
+        unique_nmis = list(dict.fromkeys(all_nmis))
+        missing_nmis = [n for n in unique_nmis if not get_cached_tariff(n)]
 
         with st.container(border=True):
             st.markdown(f'<div class="ok-banner">\u2705 Found {extracted["n_sites"]} site(s). Review data and fetch live tariffs below before generating the quote.</div>', unsafe_allow_html=True)
             
-            st.markdown('<div class="section-label">Sites Overview & Tariffs</div>', unsafe_allow_html=True)
+            # --- THE NEW BULK BUTTON SECTION ---
+            st.markdown('<div class="section-label" style="margin-top: 1rem;">Network Tariff Lookup (Bulk)</div>', unsafe_allow_html=True)
+            if missing_nmis:
+                st.caption(f"There are **{len(missing_nmis)}** site(s) missing live tariffs. Click below to fetch them all at once.")
+                render_bulk_lookup_button(missing_nmis, key="run_bulk_lookup")
+            elif unique_nmis:
+                st.markdown('<div class="ok-banner" style="margin-top: 0.5rem;">✅ All live tariffs successfully fetched for this portfolio!</div>', unsafe_allow_html=True)
+            else:
+                st.caption("No NMIs were found in this portfolio to look up.")
+            # -----------------------------------
+            
+            st.markdown('<div class="section-label" style="margin-top: 1rem;">Sites Overview & Tariffs</div>', unsafe_allow_html=True)
             
             for i, bill in enumerate(extracted["bills"], start=1):
                 label = bill.get("site_address") or bill.get("customer_name") or f"Site {i}"
@@ -671,7 +693,6 @@ with tab_consolidated:
                 with st.expander(f"{i}. {label} (NMI: {nmi or 'None'})", expanded=False):
                     render_bill_tables(bill)
                     
-                    st.markdown('<div class="section-label" style="margin-top: 1rem;">Network Tariff Lookup</div>', unsafe_allow_html=True)
                     if not nmi:
                         st.caption("No NMI extracted — automated lookup suspended for this site.")
                     else:
@@ -679,13 +700,12 @@ with tab_consolidated:
                         if cached:
                             st.markdown(f'<div class="ok-banner">\u2705 Live NTC fetched: <b>{cached}</b></div>', unsafe_allow_html=True)
                             st.button(
-                                "\u21BA Re-fetch tariff",
+                                "\u21BA Reset this tariff",
                                 key=f"refetch_cons_{nmi}_{i}",
                                 on_click=lambda target=nmi: (clear_cached_tariff(target), st.rerun()),
                             )
                         else:
-                            st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '\u2014'}**. Click to fetch live NTC.")
-                            render_auto_lookup(nmi, key=f"multi_{nmi}_{i}")
+                            st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '\u2014'}**. Awaiting bulk lookup above.")
 
             st.markdown('<div class="section-label" style="margin-top: 2rem;">Generate Quote</div>', unsafe_allow_html=True)
             gcol1, gcol2 = st.columns([1, 1])
