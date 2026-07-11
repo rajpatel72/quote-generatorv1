@@ -41,12 +41,14 @@ ASSUMPTIONS - FLAGGED HERE BECAUSE THEY MATERIALLY CHANGE THE NUMBERS AND
 ARE EASY TO GET WRONG SILENTLY. Worth spot-checking against 2-3 known real
 offers before trusting this for a live quote:
 
-  1. DISCOUNT SCALE: the "Discount" column is read as a plain percentage
-     number (e.g. 20 means 20%) and divided by 100 before being written to
-     the template's K column, which expects a fraction (same convention the
-     existing F column already uses for Gemini-extracted discounts). If a
-     particular row is actually already stored as a fraction, this will
-     under-discount that row by 100x.
+  1. UNITS: the Comparison sheet's rate fields (everything except Discount
+     and Sign-up Credit) are stored in cents and converted to dollars at
+     load time (see CENTS_TO_DOLLARS_FIELDS) to match the bill's own
+     extracted rates and the template's Current Offer column. Discount is
+     read as a plain percentage (20 means 20%) and Sign-up Credit is
+     assumed to already be a dollar amount - if either of those turns out
+     to be stored differently for some rows, this will misprice just that
+     row.
   2. DISCOUNT SCOPE: the same discount fraction is applied to every matched
      charge line, including the Daily Supply Charge, mirroring how the
      template already treats discount per-row (E/F, J/K). If a real offer's
@@ -108,6 +110,32 @@ CREDIT_FIELDS = {"solar"}
 # signup_credit are handled separately, not matched against a charge line).
 CHARGE_FIELDS = [f for f in FIELD_ORDER if f not in ("discount", "signup_credit")]
 
+# The Comparison sheet stores every rate field in CENTS (e.g. 50.00 = 50c),
+# same as most AU retail rate cards, but the bill's own extracted rates -
+# and the template's Current Offer column - are in DOLLARS (e.g. 0.50).
+# Every field in CHARGE_FIELDS is divided by 100 at load time below so the
+# New Proposed Offer lines up with the Current Offer's units. Discount (a
+# percentage) and Sign-up Credit (already a dollar amount) are left alone.
+CENTS_TO_DOLLARS_FIELDS = set(CHARGE_FIELDS)
+
+# Brand colors for the divider column (I30, merged I30:I{total_row-1}) so
+# the quote visually flags which retailer the New Proposed Offer is from.
+# ARGB hex, as required by openpyxl's PatternFill.
+RETAILER_COLORS = {
+    "MOMENTUM": "FFADD8E6",     # Light Blue
+    "ALINTA": "FFFFA500",       # Orange
+    "NBE": "FF90EE90",          # Light Green (Next Business Energy)
+    "ORIGIN": "FFFF0000",       # Red
+    "1ST ENERGY": "FF00008B",   # Dark Blue
+    "EA": "FF808080",           # Grey (Energy Australia)
+}
+
+
+def retailer_color_hex(retailer: str | None) -> str | None:
+    if not retailer:
+        return None
+    return RETAILER_COLORS.get(retailer.strip().upper())
+
 
 def _norm(s) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip().lower()
@@ -137,7 +165,10 @@ def load_comparison(path: str) -> list[TariffRow]:
         for name, start_col in RETAILER_START_COL.items():
             vals = {}
             for i, fname in enumerate(FIELD_ORDER):
-                vals[fname] = ws.cell(row=r, column=start_col + i).value
+                raw = ws.cell(row=r, column=start_col + i).value
+                if fname in CENTS_TO_DOLLARS_FIELDS and isinstance(raw, (int, float)):
+                    raw = raw / 100.0
+                vals[fname] = raw
             retailers[name] = vals
         rows.append(
             TariffRow(
