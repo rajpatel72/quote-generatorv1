@@ -94,7 +94,7 @@ st.markdown(
     p, span, label, li, div { font-family: 'Inter', 'Space Grotesk', sans-serif; }
 
     .stApp { background: var(--canvas); }
-    .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1080px; margin: 0 auto; }
+    .block-container { padding-top: 4.2rem; padding-bottom: 3rem; max-width: 1280px; margin: 0 auto; }
 
     /* ---- Header ---- */
     .hero-badge {
@@ -168,6 +168,7 @@ st.markdown(
     .stTabs [aria-selected="true"] {
         background: var(--card) !important;
         box-shadow: 0 1px 3px rgba(16, 25, 46, 0.08);
+        padding: 10px;
     }
     .stTabs [aria-selected="true"] p { color: var(--navy) !important; }
 
@@ -189,6 +190,10 @@ st.markdown(
     }
     .stButton > button[kind="secondary"]:hover, .stDownloadButton > button[kind="secondary"]:hover {
         border-color: var(--navy-2); color: var(--navy-2) !important;
+    }
+
+    .st-emotion-cache-ds661v, .st-emotion-cache-rzg2vg {   
+    border: solid 1px grey;
     }
 
     /* ---- Metrics ---- */
