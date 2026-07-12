@@ -675,7 +675,7 @@ with tab_single:
                     )
                 else:
                     st.caption(
-                        f"Bill shows tariff **{extracted['data'].get('tariff_classification') or '\u2014'}** for NMI **{nmi}**. "
+                        f"Bill shows tariff **{extracted['data'].get('tariff_classification') or '—'}** for NMI **{nmi}**. "
                         "Click below to fetch the live network tariff from the sales portal (opens in a new tab \u2014 "
                         "requires the GloBird NTC Fetcher Tampermonkey script and an active portal login)."
                     )
@@ -759,7 +759,7 @@ with tab_consolidated:
                                 on_click=lambda target=nmi: (clear_cached_tariff(target), st.rerun()),
                             )
                         else:
-                            st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '\u2014'}**. Awaiting bulk lookup above.")
+                            st.caption(f"Bill shows tariff **{bill.get('tariff_classification') or '-'}**. Awaiting bulk lookup above.")
 
             st.markdown('<div class="section-label" style="margin-top: 2rem;">Generate Quote</div>', unsafe_allow_html=True)
             gcol1, gcol2 = st.columns([1, 1])
