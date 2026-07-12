@@ -20,6 +20,7 @@ UI notes:
   a reliable "issue date" field in the schema) -- flag if you'd rather this
   used something else, e.g. a billing period end date.
 """
+import gc
 import os
 import re
 import tempfile
@@ -460,6 +461,9 @@ def extract_consolidated(pdf_bytes_list, filenames):
                 f.write(data)
             pdf_paths.append(p)
 
+        del pdf_bytes_list  # already on disk in `tmp`; no need to keep the raw bytes in RAM during extraction
+        gc.collect()
+
         status = st.status("Processing bill(s)…", expanded=True)
         try:
             if len(pdf_paths) > 1:
@@ -469,6 +473,8 @@ def extract_consolidated(pdf_bytes_list, filenames):
                 for p in pdf_paths:
                     writer.append(p)
                 writer.write(merged_path)
+                writer.close()
+                gc.collect()
             else:
                 merged_path = pdf_paths[0]
 
@@ -689,6 +695,8 @@ with tab_single:
                     res = generate_single_excel(extracted, tariff_override)
                     if res:
                         st.session_state.single_result = res
+                        st.session_state.single_extracted = None  # superseded by single_result; avoid keeping both copies
+                        gc.collect()
                         st.rerun()
             with gcol2:
                 st.button("\U0001F504 Start over", key="reset_single_extracted", on_click=reset_single)
@@ -769,6 +777,8 @@ with tab_consolidated:
                         res = generate_consolidated_excel(extracted, client_name)
                         if res:
                             st.session_state.consolidated_result = res
+                            st.session_state.consolidated_extracted = None  # superseded by consolidated_result
+                            gc.collect()
                             st.rerun()
             with gcol2:
                 st.button("\U0001F504 Start over", key="reset_cons_extracted", on_click=reset_consolidated)
