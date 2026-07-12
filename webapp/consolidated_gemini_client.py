@@ -67,6 +67,7 @@ Rules for each site's extraction (same as single-bill extraction):
   found confidently, return null for it rather than guessing.
 - distribution_region must be the network DISTRIBUTOR (poles-and-wires company), not the retailer.
   Only fill it if it's explicitly printed on the bill (e.g. next to faults/emergencies contact info).
+- Never swap peak, off-peak, shoulder etc with different charge. (e.g. Peak charges must go with Peak & off-peak charges must go with off-peak and so on).
 - Include every charge line used to reach that site's total: daily/supply charge, and every energy
   charge band (peak, off-peak, shoulder, controlled load, anytime, demand), plus solar feed-in as a
   credit line if present. Do not include Rounding Adjustment. Do not include GST as its own line, and do not include the total itself
