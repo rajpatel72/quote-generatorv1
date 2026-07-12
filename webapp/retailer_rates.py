@@ -137,6 +137,69 @@ def retailer_color_hex(retailer: str | None) -> str | None:
     return RETAILER_COLORS.get(retailer.strip().upper())
 
 
+# ---------------------------------------------------------------------------
+# Retailer selection rules (business logic, on top of the raw cost engine)
+# ---------------------------------------------------------------------------
+# Maps free-text retailer names as they show up on a bill (Gemini extraction
+# of bill_data["current_energy_retailer"]) to the internal retailer keys used
+# above. Anything that doesn't match one of these patterns (e.g. "AGL",
+# "Powershop", "Simply Energy"...) returns None - it's simply not one of the
+# retailers this sheet can propose, so no exclusion rule applies to it.
+_RETAILER_NAME_PATTERNS = [
+    ("ORIGIN", ("origin",)),
+    ("MOMENTUM", ("momentum",)),
+    ("1ST ENERGY", ("1st energy", "first energy")),
+    ("NBE", ("next business", "nbe")),
+    ("ALINTA", ("alinta",)),
+    ("EA", ("energyaustralia", "energy australia")),
+    ("GLOBIRD", ("globird", "glo bird")),
+]
+
+
+def normalize_retailer_name(raw: str | None) -> str | None:
+    text = _norm(raw)
+    if not text:
+        return None
+    for key, patterns in _RETAILER_NAME_PATTERNS:
+        if any(p in text for p in patterns):
+            return key
+    return None
+
+
+# Rule 1: never re-propose the customer's CURRENT retailer, with one
+# exception - NBE and Origin are allowed to be re-proposed, but ONLY as a
+# last resort when nothing else on the sheet actually saves the customer
+# money. Every other retailer (Alinta, 1st Energy, EA, GloBird, or any
+# retailer added to the sheet later) is excluded outright, saving or not.
+REUSE_CURRENT_IF_NO_SAVING = {"NBE", "ORIGIN"}
+
+# Rule 2: sites using this much or more per year are steered toward NBE,
+# even if NBE isn't the single cheapest option on paper (commission /
+# relationship reasons, not pure cost). Annual usage is estimated from the
+# bill's usage-type charge quantities, scaled to a full year - see
+# `_estimate_annual_kwh`.
+HIGH_USAGE_KWH_THRESHOLD = 20000
+
+# Rule 3: for tariffs classified as Residential, try these retailers first
+# and only look wider if none of them beats the customer's current bill.
+# NOTE: GloBird has NO columns in Master_Retailers_Comparison.xlsx yet (the
+# sheet only has ORIGIN/MOMENTUM/1ST ENERGY/NBE/ALINTA/EA) - it's listed
+# here for when that data exists, but until then it can never actually be
+# selected. Flagged in meta["globird_unavailable"] whenever this matters.
+RESIDENTIAL_PREFERRED_RETAILERS = ["1ST ENERGY", "ALINTA", "GLOBIRD"]
+
+# Which Tariff Codes count as "Residential" for rule 3. Raj: this needs your
+# actual list of Residential NTCs - populate it here (strings, matched
+# case/space-insensitively against the live NTC), e.g.:
+RESIDENTIAL_TARIFF_CODES = {"10", "26", "15", "16", "20", "30", "EA010", "EA111", "EA251", "EA210", "EA011", "EA116", "EA025_26", "EA025", "N70", "N72", "NS70", "N73", "N73N50", "N71_26", "N71", "N705", "N706", "BLNBSS1", "BLNN2AU", "BLNT3AU", "BLNRSS2", "BLND1AR", "BLNT3AL", "6900", "8700", "8900", "8920", "8950", "8970", "8400", "8420", "8450", "8470", "3900", "3970", "3950", "3750", "OPCL", "CL", "QRSR", "MRSR", "RSR", "RTOU", "NASS11", "NAST11", "NAST11S", "NAST11P", "NAST13", "NAST14", "NAST15", "SUN23", "NEE11", "NEE13", "NEE14", "NEE15", "NEE13CL", "C1R", "C1RB", "CR", "CRSTOU", "CRTOU", "A100", "F10I", "A10D", "A130", "A120", "F120", "D1", "DD", "PRSTOU", "PRTOU", "LVS1R", "RESKW1R", "URSTOU", "URTOU", "FURTOU"}
+# Left empty for now, meaning rule 3 never fires until this is filled in.
+RESIDENTIAL_TARIFF_CODES: set[str] = set()
+
+
+def is_residential_tariff(ntc: str) -> bool:
+    return _norm(ntc) in {_norm(c) for c in RESIDENTIAL_TARIFF_CODES}
+
+
 def _norm(s) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip().lower()
 
@@ -292,48 +355,145 @@ def _cost_for_retailer(charges: list[dict], field_map: list[str | None], rates: 
     return total, per_line, unavailable
 
 
-def find_best_offer(
+def _estimate_annual_kwh(charges: list[dict], field_map: list[str | None], billing_days: float) -> float | None:
+    """
+    Sums the bill's usage-type (kWh) charge quantities - Peak/Peak2/Shoulder/
+    Off Peak/CL1-3, explicitly excluding Daily Supply, Capacity, Demand
+    (kW not kWh) and Solar (generation credit, not consumption) - and scales
+    the billing-period total up to a full year. Returns None if none of the
+    bill's lines classified as a usage field (can't estimate).
+    """
+    usage_fields = {"peak", "peak2", "shoulder", "offpeak", "cl1", "cl2", "cl3"}
+    total_kwh = 0.0
+    found = False
+    for charge, fname in zip(charges, field_map):
+        if fname in usage_fields:
+            total_kwh += charge.get("quantity") or 0
+            found = True
+    if not found:
+        return None
+    days = billing_days or 30
+    return total_kwh * (365.0 / days)
+
+
+def _eligible_retailers(candidates: list[TariffRow], charges: list[dict], field_map: list[str | None], billing_days: float):
+    """
+    Returns {retailer: (TariffRow, total_cost, per_line_rates)} for every
+    retailer that can be FULLY priced (every matched charge line has a
+    published rate) on at least one of the candidate tariff rows. If more
+    than one candidate row prices the same retailer, the cheapest is kept.
+    """
+    best: dict[str, tuple] = {}
+    for row in candidates:
+        for retailer, rates in row.retailers.items():
+            if all(_missing(v) for v in rates.values()):
+                continue
+            total, per_line, unavailable = _cost_for_retailer(charges, field_map, rates, billing_days)
+            if unavailable:
+                continue
+            if retailer not in best or total < best[retailer][1]:
+                best[retailer] = (row, total, per_line)
+    return best
+
+
+def _current_bill_total(charges: list[dict]) -> float | None:
+    try:
+        return sum(
+            (c.get("quantity") or 0)
+            * (c.get("rate_before_discount") or 0)
+            * (1 - (c.get("conditional_discount_pct") or 0))
+            * (-1 if c.get("is_credit") else 1)
+            for c in charges
+        )
+    except Exception:
+        return None
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+def select_offer(
     rows: list[TariffRow],
     charges: list[dict],
     ntc: str,
     state: str | None,
     distribution: str | None,
+    current_retailer_raw: str | None,
     billing_days: float = 30,
 ):
     """
-    Returns a dict:
-        {
-          "retailer": "NBE" | None,
-          "tariff_row": TariffRow | None,
-          "total_cost": float | None,
-          "per_line_rates": [ {"rate":.., "discount_pct":..} | None, ... ],
-          "match_level": "...",
-          "field_map": [...],
-          "candidates_considered": int,
-          "eligible_retailers": [...],
-        }
-    If nothing prices cleanly, retailer/tariff_row/total_cost are None and
-    the caller should fall back to leaving the New Proposed Offer columns
-    blank rather than guessing.
+    Applies the retailer selection rules on top of the raw cost engine:
+
+      1. Never re-propose the customer's current retailer, EXCEPT NBE and
+         Origin, which may be re-proposed only if nothing else saves money.
+      2. Sites estimated at 20,000+ kWh/year are steered toward NBE, even if
+         it isn't the strict cheapest option.
+      3. Residential-tariff bills (RESIDENTIAL_TARIFF_CODES) are steered
+         toward 1st Energy / Alinta / GloBird first; if none of those beats
+         the current bill, the search widens to every eligible retailer.
+      4. Otherwise (or if the above tiers find nothing that saves money):
+         cheapest eligible retailer that actually beats the current bill,
+         excluding the current retailer.
+      5. If literally nothing beats the current bill: NBE/Origin fall back
+         to being reused as-is; any other current retailer instead gets the
+         best-effort cheapest alternative on the sheet, clearly flagged in
+         meta as not an actual saving (see `build_proposed_charges`).
+
+    Returns a dict shaped like the old find_best_offer(), plus "tier" (which
+    rule fired) and "current_retailer" (normalized key or None).
     """
     field_map = classify_charges(charges)
     candidates, match_level = _find_candidates(rows, ntc, state, distribution)
+    eligible = _eligible_retailers(candidates, charges, field_map, billing_days)
+    current_total = _current_bill_total(charges)
+    current_key = normalize_retailer_name(current_retailer_raw)
+    annual_kwh = _estimate_annual_kwh(charges, field_map, billing_days)
+    residential = is_residential_tariff(ntc)
 
-    best = None
-    eligible = []
-    for row in candidates:
-        for retailer, rates in row.retailers.items():
-            # Skip retailers with no data at all on this row.
-            if all(_missing(v) for v in rates.values()):
-                continue
-            total, per_line, unavailable = _cost_for_retailer(charges, field_map, rates, billing_days)
-            if unavailable:
-                continue  # can't fully price this retailer for this bill's line items
-            eligible.append((retailer, row, total))
-            if best is None or total < best[2]:
-                best = (retailer, row, total, per_line)
+    # Rule 1: current retailer is excluded from the primary search pool.
+    primary_pool = [r for r in eligible if r != current_key]
 
-    if best is None:
+    def cheapest(pool):
+        items = [(r, eligible[r][1]) for r in pool if r in eligible]
+        return min(items, key=lambda x: x[1])[0] if items else None
+
+    def saves_money(retailer):
+        return current_total is None or eligible[retailer][1] < current_total
+
+    chosen, tier = None, None
+
+    # Rule 2: high usage -> prefer NBE outright if it's a candidate at all.
+    if annual_kwh is not None and annual_kwh >= HIGH_USAGE_KWH_THRESHOLD and "NBE" in primary_pool:
+        chosen, tier = "NBE", f"high_usage_prefers_nbe (~{annual_kwh:,.0f} kWh/yr est.)"
+
+    # Rule 3: residential tariff -> try the preferred group first.
+    if chosen is None and residential:
+        pref_pool = [r for r in primary_pool if r in RESIDENTIAL_PREFERRED_RETAILERS]
+        candidate = cheapest(pref_pool)
+        if candidate is not None and saves_money(candidate):
+            chosen, tier = candidate, "residential_tariff_preferred"
+
+    # Default: cheapest retailer that actually beats the current bill.
+    if chosen is None:
+        candidate = cheapest(primary_pool)
+        if candidate is not None and saves_money(candidate):
+            chosen, tier = candidate, "cheapest_saving"
+
+    # Rule 1 exception + best-effort fallback: nothing above saved money.
+    if chosen is None:
+        if current_key in REUSE_CURRENT_IF_NO_SAVING and current_key in eligible:
+            chosen, tier = current_key, "no_saving_reuse_current"
+        else:
+            candidate = cheapest(primary_pool)
+            if candidate is not None:
+                chosen, tier = candidate, "no_saving_best_effort"
+
+    globird_unavailable = residential and "GLOBIRD" not in eligible and "GLOBIRD" not in RETAILER_START_COL
+
+    if chosen is None:
         return {
             "retailer": None,
             "tariff_row": None,
@@ -342,26 +502,33 @@ def find_best_offer(
             "match_level": match_level,
             "field_map": field_map,
             "candidates_considered": len(candidates),
-            "eligible_retailers": [],
+            "eligible_retailers": sorted(eligible.keys()),
+            "tier": tier or "no_eligible_retailer",
+            "current_retailer": current_key,
+            "current_total": current_total,
+            "residential": residential,
+            "annual_kwh_estimate": annual_kwh,
+            "globird_unavailable": globird_unavailable,
         }
 
-    retailer, row, total, per_line = best
+    row, total, per_line = eligible[chosen]
     return {
-        "retailer": retailer,
+        "retailer": chosen,
         "tariff_row": row,
         "total_cost": total,
         "per_line_rates": per_line,
         "match_level": match_level,
         "field_map": field_map,
         "candidates_considered": len(candidates),
-        "eligible_retailers": sorted({e[0] for e in eligible}),
-        "signup_credit": row.retailers[retailer].get("signup_credit"),
+        "eligible_retailers": sorted(eligible.keys()),
+        "signup_credit": row.retailers[chosen].get("signup_credit"),
+        "tier": tier,
+        "current_retailer": current_key,
+        "current_total": current_total,
+        "residential": residential,
+        "annual_kwh_estimate": annual_kwh,
+        "globird_unavailable": globird_unavailable,
     }
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 def build_proposed_charges(bill_data: dict, ntc: str, comparison_path: str) -> tuple[list[dict], dict]:
     """
     High-level helper for app.py:
@@ -371,22 +538,27 @@ def build_proposed_charges(bill_data: dict, ntc: str, comparison_path: str) -> t
         )
         fill_quote(extracted["data"], out_path,
                    tariff_override=live_ntc,
-                   proposed_charges=proposed_charges)
+                   proposed_charges=proposed_charges,
+                   proposed_retailer_color=retailer_color_hex(meta["retailer"]))
 
     `proposed_charges` is the SAME length/order as bill_data["charges"], each
     entry either None (leave that row's J/K blank - couldn't price it) or
     {"rate_before_discount": .., "conditional_discount_pct": .., "is_credit": ..}
     ready to be written by single_excel_filler in place of the bill's own
     rate_before_discount/conditional_discount_pct for that row.
+
+    Retailer choice applies the rules in select_offer() - see its docstring
+    - not just "cheapest wins".
     """
     charges = bill_data.get("charges") or []
     rows = load_comparison(comparison_path)
-    result = find_best_offer(
+    result = select_offer(
         rows,
         charges,
         ntc=ntc,
         state=bill_data.get("state"),
         distribution=bill_data.get("distribution_region"),
+        current_retailer_raw=bill_data.get("current_energy_retailer"),
         billing_days=bill_data.get("billing_period_days") or 30,
     )
 
@@ -409,17 +581,13 @@ def build_proposed_charges(bill_data: dict, ntc: str, comparison_path: str) -> t
         if f is None
     ]
 
-    current_total = None
-    try:
-        current_total = sum(
-            (c.get("quantity") or 0)
-            * (c.get("rate_before_discount") or 0)
-            * (1 - (c.get("conditional_discount_pct") or 0))
-            * (-1 if c.get("is_credit") else 1)
-            for c in charges
-        )
-    except Exception:
-        pass
+    current_total = result.get("current_total")
+    proposed_total = result.get("total_cost")
+    saving = (
+        current_total - proposed_total
+        if current_total is not None and proposed_total is not None
+        else None
+    )
 
     meta = {
         "retailer": result["retailer"],
@@ -427,13 +595,19 @@ def build_proposed_charges(bill_data: dict, ntc: str, comparison_path: str) -> t
         "match_level": result["match_level"],
         "candidates_considered": result["candidates_considered"],
         "eligible_retailers": result["eligible_retailers"],
-        "proposed_total": result["total_cost"],
+        "proposed_total": proposed_total,
         "current_total": current_total,
-        "estimated_saving": (
-            current_total - result["total_cost"]
-            if current_total is not None and result["total_cost"] is not None
-            else None
-        ),
+        "estimated_saving": saving,
+        # True only when the chosen retailer was a best-effort pick that
+        # does NOT actually beat the current bill (tier
+        # "no_saving_reuse_current" / "no_saving_best_effort") - the UI
+        # should say so rather than implying a saving that isn't there.
+        "no_actual_saving": bool(saving is not None and saving <= 0),
+        "selection_tier": result.get("tier"),
+        "current_retailer_normalized": result.get("current_retailer"),
+        "is_residential_tariff": result.get("residential"),
+        "annual_kwh_estimate": result.get("annual_kwh_estimate"),
+        "globird_unavailable": result.get("globird_unavailable"),
         "signup_credit": result.get("signup_credit"),
         "unmatched_descriptions": unmatched,
     }
