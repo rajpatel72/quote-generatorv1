@@ -163,7 +163,13 @@ def fill_quote(
     ws = wb[SHEET_NAME]
 
     # --- header / customer fields ---
-    ws["A6"] = bill_data.get("customer_name").upper()
+    # For strata bills, "customer_name" as printed on the bill is often the
+    # OC (Owners Corporation) number rather than a person/company name -
+    # that's expected and correct, not a bad extraction. If customer_name
+    # itself is missing, fall back to oc_number so A6 still isn't blank -
+    # same fallback the bulk/consolidated view already uses for its table.
+    display_name = bill_data.get("customer_name") or bill_data.get("oc_number") or ""
+    ws["A6"] = display_name.upper() or None
 
     nmi = bill_data.get("nmi_or_mirn")
 
