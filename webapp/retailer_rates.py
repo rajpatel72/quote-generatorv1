@@ -215,35 +215,73 @@ class TariffRow:
     retailers: dict = field(default_factory=dict)  # retailer -> {field: value|None}
 
 
+#  In-process cache, keyed by (path, mtime), so the comparison workbook is
+#  only ever parsed once per file version instead of on every single quote
+#  generation. build_proposed_charges() -> load_comparison() used to be
+#  called fresh (a full openpyxl parse of a wide 6-retailer x 14-col sheet)
+#  for every single-site quote - on Streamlit's resource-limited hosting
+#  tier this was the single biggest contributor to the container's memory
+#  climbing over a session until it got OOM-killed (surfaces as the
+#  "Segmentation fault" you saw, since the killed process can die mid
+#  native-library call rather than with a clean Python traceback).
+_comparison_cache: dict[str, tuple[float, list["TariffRow"]]] = {}
+
+
 def load_comparison(path: str) -> list[TariffRow]:
-    """Loads every tariff row from the Comparison sheet into memory."""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[COMPARISON_SHEET]
-    rows = []
-    for r in range(3, ws.max_row + 1):
-        tariff_code = ws.cell(row=r, column=2).value
-        if tariff_code in (None, ""):
-            continue
-        retailers = {}
-        for name, start_col in RETAILER_START_COL.items():
-            vals = {}
-            for i, fname in enumerate(FIELD_ORDER):
-                raw = ws.cell(row=r, column=start_col + i).value
-                if fname in CENTS_TO_DOLLARS_FIELDS and isinstance(raw, (int, float)):
-                    raw = raw / 100.0
-                vals[fname] = raw
-            retailers[name] = vals
-        rows.append(
-            TariffRow(
-                row_num=r,
-                type_=ws.cell(row=r, column=1).value,
-                tariff_code=str(tariff_code).strip(),
-                cl_components=ws.cell(row=r, column=3).value,
-                state=ws.cell(row=r, column=4).value,
-                distribution=ws.cell(row=r, column=5).value,
-                retailers=retailers,
+    """Loads (and caches) every tariff row from the Comparison sheet.
+
+    Cache is invalidated automatically if the file's mtime changes (e.g. you
+    replace Master_Retailers_Comparison.xlsx with an updated version), so
+    there's no need to restart the app after updating rates - just re-upload
+    the file with a newer mtime.
+
+    Uses openpyxl's `read_only=True` streaming mode rather than the default
+    fully-materialized workbook: read_only mode never builds an in-memory
+    object graph for the whole sheet, it streams row-by-row instead, which
+    uses a fraction of the memory for a read-only extraction like this one.
+    """
+    mtime = os.path.getmtime(path)
+    cached = _comparison_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        ws = wb[COMPARISON_SHEET]
+        rows = []
+        # values_only=True skips building Cell objects entirely and just
+        # hands back plain Python values - the cheapest possible read.
+        for r, row_values in enumerate(ws.iter_rows(min_row=3, values_only=True), start=3):
+            tariff_code = row_values[1] if len(row_values) > 1 else None
+            if tariff_code in (None, ""):
+                continue
+            retailers = {}
+            for name, start_col in RETAILER_START_COL.items():
+                vals = {}
+                for i, fname in enumerate(FIELD_ORDER):
+                    col_idx = start_col + i - 1  # 1-indexed sheet col -> 0-indexed tuple
+                    raw = row_values[col_idx] if col_idx < len(row_values) else None
+                    if fname in CENTS_TO_DOLLARS_FIELDS and isinstance(raw, (int, float)):
+                        raw = raw / 100.0
+                    vals[fname] = raw
+                retailers[name] = vals
+            rows.append(
+                TariffRow(
+                    row_num=r,
+                    type_=row_values[0] if len(row_values) > 0 else None,
+                    tariff_code=str(tariff_code).strip(),
+                    cl_components=row_values[2] if len(row_values) > 2 else None,
+                    state=row_values[3] if len(row_values) > 3 else None,
+                    distribution=row_values[4] if len(row_values) > 4 else None,
+                    retailers=retailers,
+                )
             )
-        )
+    finally:
+        # read_only workbooks keep an open zip file handle until closed -
+        # always release it, even if parsing raised.
+        wb.close()
+
+    _comparison_cache[path] = (mtime, rows)
     return rows
 
 
