@@ -55,6 +55,7 @@ Rules:
 - Convert cent-based rates (c/kWh, c/day) to dollars (divide by 100).
 - Do not invent, infer, or calculate values that are not clearly present. If a field cannot be
   found confidently, return null for it rather than guessing.
+- Never swap peak, off-peak, shoulder etc with different charge. (e.g. Peak charges must go with Peak & off-peak charges must go with off-peak and so on).
 - distribution_region must be the network DISTRIBUTOR (poles-and-wires company), not the retailer.
   Only fill it if it's explicitly printed on the bill (e.g. next to faults/emergencies contact info).
 - Include every charge line used to reach the total: daily/supply charge, and every energy charge
