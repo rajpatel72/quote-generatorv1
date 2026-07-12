@@ -412,12 +412,17 @@ def render_single_result(res: dict):
         st.caption(f"\u26A0\uFE0F New Proposed Offer wasn't priced: {offer_meta['error']}")
     elif offer_meta.get("retailer"):
         saving = offer_meta.get("estimated_saving")
-        saving_txt = f" \u2014 est. saving vs current bill: **{saving:,.2f}**" if isinstance(saving, (int, float)) else ""
+        if offer_meta.get("no_actual_saving"):
+            saving_txt = f" \u2014 \u26A0\uFE0F best-effort pick, does **not** beat the current bill (diff: {saving:,.2f})" if isinstance(saving, (int, float)) else " \u2014 \u26A0\uFE0F best-effort pick, doesn't beat the current bill"
+        else:
+            saving_txt = f" \u2014 est. saving vs current bill: **{saving:,.2f}**" if isinstance(saving, (int, float)) else ""
         source_txt = "live NTC" if offer_meta.get("ntc_source") == "live_lookup" else "bill's printed tariff (no live NTC)"
         st.caption(
             f"\U0001F4A1 New Proposed Offer: **{offer_meta['retailer']}** on tariff **{offer_meta.get('tariff_code')}** "
-            f"(matched via {offer_meta.get('match_level')}, using {source_txt}){saving_txt}."
+            f"(matched via {offer_meta.get('match_level')}, using {source_txt}, rule: {offer_meta.get('selection_tier')}){saving_txt}."
         )
+        if offer_meta.get("globird_unavailable"):
+            st.caption("\u26A0\uFE0F This is a Residential tariff (GloBird preferred) but GloBird has no rates in the comparison sheet yet, so it couldn't be considered.")
         if offer_meta.get("unmatched_descriptions"):
             st.caption(
                 f"\u26A0\uFE0F Left blank on the New Proposed Offer side (couldn't classify): "
